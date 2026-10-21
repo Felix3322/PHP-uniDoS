@@ -1,0 +1,4 @@
+php_value memory_limit 8M
+php_value session.use_strict_mode 1
+# Optionally set session.save_path to a dedicated writable directory.
+# Keep session.use_only_cookies and session.upload_progress.cleanup enabled.

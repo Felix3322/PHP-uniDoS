@@ -1,0 +1,5 @@
+test-*.json
+*.log
+__pycache__/
+*.pyc
+DIFF-RESEARCH.md

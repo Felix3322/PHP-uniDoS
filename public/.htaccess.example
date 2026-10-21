@@ -1,0 +1,4 @@
+# For an isolated Apache mod_php lab only. Install as .htaccess after
+# confirming AllowOverride Options. This per-directory INI diagnostic is a
+# candidate early consumer for CVE-2026-109619 on PHP 8.5.
+php_value auto_detect_line_endings 1
