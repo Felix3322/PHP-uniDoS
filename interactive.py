@@ -109,9 +109,9 @@ class Console:
         }
         self.target_mem_limit = None
         self.target_post_max = None
-        self.part_headers = 2_000_000
-        self.empty_files = 200_000
-        self.field_bytes = 256 * 1024 * 1024
+        self.part_headers = 599_000
+        self.empty_files = 59_000
+        self.field_bytes = 8 * 1024 * 1024 - 256
         self.pad_kib = 1340
         self.field_name_kib = 700
         self.timeout = 60.0
