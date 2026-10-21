@@ -136,6 +136,8 @@ class Console:
             else:
                 print("No target set. Usage: target <url>")
             return
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
         self.scheme, self.host, self.port, self.prefix = parse_target(url)
         self.target = url
         print(f"\033[92mTarget set: {self.scheme}://{self.host}:{self.port}{self.prefix}\033[0m")
