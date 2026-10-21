@@ -10,6 +10,28 @@
 
 Universal DoS attack toolkit for PHP CVE-2026-109618 and CVE-2026-109619.
 
+### Interactive Console
+
+```bash
+python interactive.py
+# or with target:
+python interactive.py http://target:8088
+```
+
+```
+Commands:
+  target <url>                Set target URL (e.g. http://192.168.1.10:8088)
+  show                        Show current settings
+  health                      Send health check to target
+  109618 [strategy]           Execute CVE-2026-109618 OOM attack
+                              Strategies: part-headers, empty-files, form-value, files-registration
+  109619                      Execute CVE-2026-109619 cross-request crash (fatal-backtrace)
+  session                     Execute CVE-2026-109619 session lifecycle probe
+  set <key> <value>           Set parameter (see 'set' for list)
+  help                        Show this help
+  exit / quit                 Exit
+```
+
 ### Two DoS Paths
 
 #### CVE-2026-109618: Multipart Parsing OOM Crash
@@ -68,6 +90,7 @@ python availability_probe.py --target http://target:8089 --expected-php 8.5.12 -
 
 ```
 DoS-Attack/
+├── interactive.py               # Interactive DoS console (REPL)
 ├── attacker.py                  # Main attack tool (109618 OOM + 109619 cross-request)
 ├── availability_probe.py        # Availability measurement (109619 A→B + continuous health sampling)
 ├── session_progress_probe.py    # Session upload-progress lifecycle diagnostic
@@ -114,6 +137,28 @@ HTTP 500, connection reset, worker PID change, or OOM **alone are insufficient t
 > eness/php2shell
 
 PHP CVE-2026-109618 和 CVE-2026-109619 的通用拒绝服务攻击工具集。
+
+### 交互控制台
+
+```bash
+python interactive.py
+# 或直接指定目标：
+python interactive.py http://target:8088
+```
+
+```
+Commands:
+  target <url>                设置目标 URL（如 http://192.168.1.10:8088）
+  show                        显示当前设置
+  health                      发送健康检查
+  109618 [strategy]           执行 CVE-2026-109618 OOM 攻击
+                              策略: part-headers, empty-files, form-value, files-registration
+  109619                      执行 CVE-2026-109619 跨请求崩溃
+  session                     执行 CVE-2026-109619 Session 生命周期探针
+  set <key> <value>           设置参数（输入 set 查看列表）
+  help                        显示帮助
+  exit / quit                 退出
+```
 
 ### 两条 DoS 路径
 
@@ -173,6 +218,7 @@ python availability_probe.py --target http://target:8089 --expected-php 8.5.12 -
 
 ```
 DoS-Attack/
+├── interactive.py               # 交互式 DoS 控制台（REPL）
 ├── attacker.py                  # 主攻击工具（109618 OOM + 109619 跨请求）
 ├── availability_probe.py        # 可用性度量（109619 A→B + 持续健康采样）
 ├── session_progress_probe.py    # Session upload-progress 生命周期诊断
