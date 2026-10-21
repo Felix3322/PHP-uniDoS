@@ -1,6 +1,7 @@
 # PHP CVE-2026-109618 / CVE-2026-109619 — DoS Attack Toolkit
 
 **[中文](#中文说明) | [English](#english)**
+<img width="1453" height="862" alt="image" src="https://github.com/user-attachments/assets/f3cadc02-8a6f-42e2-948b-7e411a5923af" />
 
 ---
 
