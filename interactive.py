@@ -108,6 +108,7 @@ class Console:
             "session-upload": "session/upload.php",
         }
         self.target_mem_limit = None
+        self.target_post_max = None
         self.part_headers = 2_000_000
         self.empty_files = 200_000
         self.field_bytes = 256 * 1024 * 1024
@@ -157,20 +158,45 @@ class Console:
     def _detect_mem_limit(self, body_prefix):
         try:
             data = json.loads(body_prefix)
-            mem_str = data.get("memory_limit")
-            if not mem_str:
-                return
-            mem = parse_php_size(mem_str)
-            if mem <= 0:
-                return
-            self.target_mem_limit = mem
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return
+        mem_str = data.get("memory_limit")
+        post_str = data.get("post_max_size")
+        if mem_str:
+            try:
+                mem = parse_php_size(mem_str)
+                if mem > 0:
+                    self.target_mem_limit = mem
+            except (ValueError, TypeError):
+                pass
+        if post_str:
+            try:
+                post = parse_php_size(post_str)
+                if post > 0:
+                    self.target_post_max = post
+            except (ValueError, TypeError):
+                pass
+        if not self.target_mem_limit:
+            return
+        mem = self.target_mem_limit
+        post = self.target_post_max or 8 * 1024 * 1024
+        self.timeout = max(self.timeout, 60.0)
+        if post < mem * 2:
+            budget = post - 256
+            self.part_headers = max(budget // 14, 10_000)
+            self.empty_files = max(budget // 140, 5_000)
+            self.field_bytes = max(budget - 100, 1024)
+            post_label = post_str or f"{human_size(post)} (assumed)"
+            print(f"  \033[93mpost_max_size={post_label}, memory_limit={mem_str}\033[0m")
+            print(f"  \033[93mAuto-fit within {human_size(post)}: "
+                  f"part-headers={self.part_headers:,}, "
+                  f"empty-files={self.empty_files:,}, "
+                  f"field-bytes={human_size(self.field_bytes)}\033[0m")
+        else:
             self.field_bytes = mem * 2
             self.part_headers = max(mem // 100, 500_000)
             self.empty_files = max(mem // 600, 100_000)
-            self.timeout = max(self.timeout, 60.0)
             print(f"  \033[93mAuto-scaled payload to 2x {mem_str} ({human_size(self.field_bytes)})\033[0m")
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
 
     def require_target(self):
         if self.target is None:
@@ -192,7 +218,9 @@ class Console:
     def cmd_show(self):
         print(f"  target:        {self.target or '(not set)'}")
         mem = human_size(self.target_mem_limit) if self.target_mem_limit else "(unknown)"
+        post = human_size(self.target_post_max) if self.target_post_max else "(unknown)"
         print(f"  memory_limit:  {mem}")
+        print(f"  post_max_size: {post}")
         for k, v in self.endpoints.items():
             print(f"  {k:16s} {v}")
         print(f"  part-headers:  {self.part_headers:,}")
@@ -217,6 +245,7 @@ class Console:
             print(f"  SAPI: {data.get('sapi')}")
             print(f"  PID:  {data.get('pid')}")
             print(f"  Mem:  {data.get('memory_limit')}")
+            print(f"  Post: {data.get('post_max_size')}")
             if self.target_mem_limit is None:
                 self._detect_mem_limit(body_prefix)
         except json.JSONDecodeError:
