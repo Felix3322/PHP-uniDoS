@@ -33,6 +33,15 @@ BANNER = r"""
  |_|   |_| |_|_|        \__,_|_| |_|____/ \___/|____/
 
   PHP CVE-2026-109618 / CVE-2026-109619  DoS Console
+
+  target <url>        Set target (e.g. target 192.168.1.10:8088)
+  health              Health check
+  109618 [strategy]   OOM attack (part-headers|empty-files|form-value)
+  109619              Cross-request crash (fatal-backtrace)
+  session             Session lifecycle probe (A->B full sequence)
+  set                 Show settable parameters
+  show                Show current config
+  help                Full help
 """
 
 HELP = """
