@@ -1,0 +1,4 @@
+# Isolated Apache mod_php lab only: copy this file to early/.htaccess.
+# Requires AllowOverride Options (or All) for this directory. PHP 8.5 emits
+# an early INI deprecation; a GET of early/health.php alone is the control.
+php_value auto_detect_line_endings 1

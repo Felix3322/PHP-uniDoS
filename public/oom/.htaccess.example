@@ -1,0 +1,4 @@
+# Isolated Apache mod_php lab only: copy this file to oom/.htaccess.
+# Choose limits deliberately; the request body must stay below post_max_size.
+php_value memory_limit 8M
+php_value post_max_size 8M

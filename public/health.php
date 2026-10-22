@@ -12,5 +12,7 @@ echo json_encode([
     'auto_detect_line_endings' => ini_get('auto_detect_line_endings'),
     'memory_limit' => ini_get('memory_limit'),
     'post_max_size' => ini_get('post_max_size'),
+    'max_multipart_body_parts' => ini_get('max_multipart_body_parts'),
+    'max_file_uploads' => ini_get('max_file_uploads'),
     'upload_progress' => ini_get('session.upload_progress.enabled'),
 ], JSON_UNESCAPED_SLASHES), "\n";

