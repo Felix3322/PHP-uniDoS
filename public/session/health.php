@@ -11,5 +11,6 @@ echo json_encode([
     'fatal_error_backtraces' => ini_get('fatal_error_backtraces'),
     'auto_detect_line_endings' => ini_get('auto_detect_line_endings'),
     'memory_limit' => ini_get('memory_limit'),
+    'post_max_size' => ini_get('post_max_size'),
     'upload_progress' => ini_get('session.upload_progress.enabled'),
 ], JSON_UNESCAPED_SLASHES), "\n";

@@ -139,7 +139,7 @@ def persist(report_path, report, run_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("109618", "109619"))
-    parser.add_argument("--target", required=True, help="HTTP(S) lab URL with numeric private/loopback IP")
+    parser.add_argument("--target", required=True, help="HTTP(S) lab URL")
     parser.add_argument("--health", default="health.php")
     parser.add_argument("--producer", default="fatal-backtrace.php")
     parser.add_argument("--consumer", default="health.php")
@@ -199,6 +199,8 @@ def main():
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": args.mode,
         "target": args.target,
+        "expected_php": args.expected_php,
+        "expected_sapi": args.expected_sapi,
         "endpoints": paths,
         "executed": args.execute,
         "candidate_attempted": False,
@@ -248,6 +250,7 @@ def main():
                 plan.append(("after", "GET", paths["health"], None, None))
             else:
                 plan.extend([
+                    ("consumer_preflight", "GET", paths["consumer"], None, None),
                     ("fatal_producer", "GET", paths["producer"], None, None),
                     ("early_consumer", "GET", paths["consumer"], None, None),
                 ])
@@ -266,12 +269,14 @@ def main():
                 if step_name in ("multipart_candidate", "fatal_producer"):
                     report["candidate_response_received"] = "http_status" in result
                 persist(report_path, report, run_id)
-                if step_name == "baseline":
+                if step_name in ("baseline", "consumer_preflight"):
                     try:
                         health = json.loads(result.get("body_prefix", ""))
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, TypeError):
                         health = {}
-                    report["preflight"] = {
+                    if not isinstance(health, dict):
+                        health = {}
+                    observed = {
                         "lab_marker": health.get("lab"),
                         "php": health.get("php"),
                         "sapi": health.get("sapi"),
@@ -279,9 +284,40 @@ def main():
                         "fatal_error_backtraces": health.get("fatal_error_backtraces"),
                         "auto_detect_line_endings": health.get("auto_detect_line_endings"),
                     }
-                    ready = result.get("http_status") == 200
-                    if not ready:
-                        report["stopped_reason"] = "health endpoint returned non-200"
+                    if step_name == "baseline":
+                        report["preflight"] = observed
+                    else:
+                        report["consumer_preflight"] = observed
+                    if result.get("http_status") != 200:
+                        report["stopped_reason"] = f"{step_name} endpoint returned non-200"
+                        break
+                    if (health.get("lab") != "official-cve-lab-v1" or
+                            health.get("php") != args.expected_php or
+                            health.get("sapi") != args.expected_sapi):
+                        report["stopped_reason"] = f"{step_name} lab/version/SAPI mismatch"
+                        break
+                    if step_name == "baseline" and args.mode == "109619":
+                        if not str(health.get("php", "")).startswith("8.5."):
+                            report["stopped_reason"] = "109619 fatal-backtrace path requires PHP 8.5"
+                            break
+                        if str(health.get("fatal_error_backtraces", "")).lower() not in ("1", "on"):
+                            report["stopped_reason"] = "fatal_error_backtraces is not enabled"
+                            break
+                        if paths["consumer"] == paths["health"]:
+                            report["stopped_reason"] = "109619 requires a separate early consumer endpoint"
+                            break
+                    if (step_name == "consumer_preflight" and
+                            str(health.get("auto_detect_line_endings", "")).lower() not in ("1", "on")):
+                        report["stopped_reason"] = "early consumer INI setting is not enabled"
+                        break
+                if step_name == "fatal_producer":
+                    body_text = result.get("body_prefix", "") or ""
+                    observed_fatal = (result.get("http_status", 0) >= 500 or
+                                      "CVE_LAB_BACKTRACE_FATAL" in body_text)
+                    report["fatal_producer_observed"] = observed_fatal
+                    if not observed_fatal:
+                        report["stopped_reason"] = "fatal producer outcome not observed; consumer not sent"
+                        persist(report_path, report, run_id)
                         break
     except KeyboardInterrupt:
         report["interrupted"] = True

