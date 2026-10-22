@@ -1,6 +1,7 @@
 # PHP-uniDoS — Universal DoS for PHP CVE-2026-109618 / CVE-2026-109619
 
 **[中文](#中文说明) | [English](#english)**
+<img width="920" height="1085" alt="image" src="https://github.com/user-attachments/assets/4971abea-8d83-402d-8f41-bf61652df101" />
 <img width="1115" height="628" alt="image" src="https://github.com/user-attachments/assets/9e7bb8d9-b8a7-42d2-be91-b72d1ee1379d" />
 
 ## English
