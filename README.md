@@ -1,12 +1,15 @@
 # PHP-uniDoS — Universal DoS for PHP CVE-2026-109618 / CVE-2026-109619
 
+> Not based on ELF manipulation. Not related to the pseudo-PoCs from Is4yev/php2shell-poc or eness/php2shell.
+### 确实做不到RCE，但是可以做到无认证，无门槛持续DoS。
+### 这也够了（而且貌似CF的拦截规则未识别此流量），这不是自欺欺人的假PoC，不需要服务器主动配合。目前仍在研究获取偏移后的RCE。
+### 未授权攻击在绝大部分国家都是刑事犯罪
+
 **[中文](#中文说明) | [English](#english)**
 <img width="920" height="1085" alt="image" src="https://github.com/user-attachments/assets/4971abea-8d83-402d-8f41-bf61652df101" />
 <img width="1115" height="628" alt="image" src="https://github.com/user-attachments/assets/9e7bb8d9-b8a7-42d2-be91-b72d1ee1379d" />
 
 ## English
-
-> Not based on ELF manipulation. Not related to the pseudo-PoCs from Is4yev/php2shell-poc or eness/php2shell.
 
 Universal DoS attack toolkit for PHP CVE-2026-109618 and CVE-2026-109619. Works against **default PHP configuration** — no server changes needed.
 
