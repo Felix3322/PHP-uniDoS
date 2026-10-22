@@ -75,11 +75,13 @@ A crafted multipart body with 653,000 custom part headers fits in ~8 MiB on the 
 1. **Producer (A):** A multipart body with `PHP_SESSION_UPLOAD_PROGRESS` field + a small file upload (progress tracked) + an amplification part (653K headers → OOM). The OOM leaves stale session progress state in shared memory.
 2. **Consumer (B):** A follow-up request with the same session cookie triggers the upload-progress callback on the stale state → use-after-free → **worker crash**.
 
-Both A and B must hit the same persistent Apache worker (mod_php prefork).
+Both A and B must hit the same persistent worker — Apache mod_php (prefork) or PHP-FPM (persistent workers). Keep-alive connection pinning guarantees this on Apache; nginx+PHP-FPM requires the proxy to pin connections to the same FPM worker.
 
 ### Requirements
 
-- **Target:** Any unpatched PHP 8.5.x with Apache mod_php (prefork)
+- **Target:** Any unpatched PHP ≤ 8.1 / 8.2 < 8.2.35 / 8.3 < 8.3.36 / 8.4 < 8.4.27 / 8.5 < 8.5.12
+  - Apache mod_php (prefork) — fully supported, keep-alive pinning works directly
+  - PHP-FPM — vulnerable, but nginx `client_max_body_size` (default 1M) may reject the payload before PHP sees it; increase it or reduce `part-headers` to fit
 - **Attacker:** Python 3.8+, no dependencies
 - The target must have `session.upload_progress.enabled=On` (default) for CVE-2026-109619
 - Works with default `memory_limit=128M` and `post_max_size=8M`
@@ -173,11 +175,13 @@ DoS> dos
 1. **Producer (A):** multipart 请求包含 `PHP_SESSION_UPLOAD_PROGRESS` 字段 + 小文件上传（progress 被追踪）+ 放大 part（653K headers → OOM）。OOM 在共享内存中留下 stale session progress 状态。
 2. **Consumer (B):** 使用相同 session cookie 的后续请求触发 upload-progress 回调，访问已释放的内存 → use-after-free → **worker 崩溃**。
 
-A 和 B 必须命中同一个常驻 Apache worker（mod_php prefork）。
+A 和 B 必须命中同一个常驻 worker — Apache mod_php（prefork）或 PHP-FPM（常驻 worker）。Keep-alive 连接固定在 Apache 上直接生效；nginx+PHP-FPM 需要代理将连接固定到同一 FPM worker。
 
 ### 要求
 
-- **目标：** 任何未修补的 PHP 8.5.x + Apache mod_php（prefork）
+- **目标：** 任何未修补的 PHP ≤ 8.1 / 8.2 < 8.2.35 / 8.3 < 8.3.36 / 8.4 < 8.4.27 / 8.5 < 8.5.12
+  - Apache mod_php（prefork）— 完全支持，keep-alive 固定直接生效
+  - PHP-FPM — 存在漏洞，但 nginx `client_max_body_size`（默认 1M）可能在 PHP 处理前拒绝请求；需增大该值或减小 `part-headers` 使载荷符合限制
 - **攻击端：** Python 3.8+，无额外依赖
 - 目标需要 `session.upload_progress.enabled=On`（默认开启）才能触发 CVE-2026-109619
 - 在默认 `memory_limit=128M`、`post_max_size=8M` 下即可工作

